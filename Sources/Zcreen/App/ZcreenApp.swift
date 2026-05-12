@@ -14,6 +14,9 @@ struct ZcreenApp: App {
     }
 
     init() {
+        // 启动本地日志（清理 >2 天的旧文件 + 写启动分隔符），早于其它日志调用
+        FileLogSink.shared.bootstrap()
+
         // Prompt for accessibility permission on first launch
         if !AccessibilityHelper.isTrusted {
             AccessibilityHelper.requestAccess()

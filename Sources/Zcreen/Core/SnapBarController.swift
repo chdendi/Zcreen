@@ -163,7 +163,11 @@ final class SnapBarController: ObservableObject {
 
         guard dragState == .snapping, isShowing, let panel else { return }
 
-        if let preset = panel.presetAt(mouse) {
+        // 优先用拖拽中最后一次高亮的 preset：mouseUp 是轮询检测的，
+        // 此刻读到的鼠标位置可能比真实释放时刻晚 0~16ms，
+        // 用 highlightedPreset 才能保证"所见即所得"。
+        // 兜底：如果上一帧还没命中过任何 zone，再用当前位置兜底命中一次。
+        if let preset = panel.state.highlightedPreset ?? panel.presetAt(mouse) {
             applyPreset(preset)
         }
         hidePanel()
@@ -198,8 +202,11 @@ final class SnapBarController: ObservableObject {
 
         let accessibilityVisible = CoordinateConverter.nsToAccessibility(screen.visibleFrame, mainScreenFrame: mainScreenFrame)
         let frame = preset.frame(for: accessibilityVisible)
+        Log.general.info(
+            "Snap '\(preset.id)' on \(screen.localizedName) "
+            + "target=(\(frame.origin.x), \(frame.origin.y), \(frame.width), \(frame.height))"
+        )
         windowManager.moveWindow(win, toFrame: frame)
-        Log.general.info("Snapped '\(preset.id)' on \(screen.localizedName)")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + Constants.SnapBar.snapSaveDelay) { [weak self] in
             self?.onSnap?()

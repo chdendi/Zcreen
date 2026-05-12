@@ -17,12 +17,49 @@ final class Orchestrator: ObservableObject {
     private let screenSessionService: ScreenSessionService
     private let snapshotService: SnapshotService
     private let ruleApplyService: RuleApplyService
+    private let powerMonitor: PowerStateMonitor
     private let isAccessibilityTrusted: () -> Bool
     private let requestAccessibilityAccess: () -> Void
     private let scheduleAfter: (TimeInterval, @escaping () -> Void) -> Void
 
     private var cancellables = Set<AnyCancellable>()
     private var autoSaveTimer: Timer?
+
+    // MARK: - Wake-settle state machine
+    //
+    // After resume the orchestrator runs an adaptive debounce instead of a single
+    // fixed-delay restore. Two stages live inside one "wake-settle window":
+    //
+    //   awaitingFirstRestore — no restore yet. Each reconfig event re-arms the
+    //     debounce timer; if a profile matching `wakeSettleExpectedKey`
+    //     (= the pre-suspend profile) shows up, restore immediately. Otherwise we
+    //     wait at most `wakeSettleDelay` of silence before doing a best-effort
+    //     restore against whatever the detector currently reports.
+    //
+    //   awaitingExit (cooldown) — first restore has fired. Reconfig events that
+    //     match the last restored profile are absorbed (re-arm cooldown only).
+    //     Events that drift back to expected re-trigger restore. Other transients
+    //     are absorbed too — we don't chase every flicker macOS emits while it's
+    //     still negotiating modes on external displays.
+    //
+    // The window exits after `wakeSettleCooldownDelay` of silence post-restore.
+    private enum WakeSettleStage {
+        case awaitingFirstRestore
+        case awaitingExit
+    }
+    /// Generation token for the wake-settle scheduler closure. Each new event
+    /// bumps it; queued closures only run if their captured generation still
+    /// matches, which gives us free cancellation of stale timers.
+    private var wakeSettleGeneration: UInt64 = 0
+    private var isInWakeSettleWindow: Bool = false
+    private var wakeSettleStage: WakeSettleStage = .awaitingFirstRestore
+    /// Profile key from before the suspend cycle, used as the heuristic target —
+    /// matching it short-circuits the debounce wait.
+    private var wakeSettleExpectedKey: String = ""
+    /// Last profile we restored to inside this wake-settle window. Used in
+    /// cooldown to decide whether a new event is just a duplicate echo or a
+    /// genuine drift that warrants another restore.
+    private var wakeSettleLastRestoredKey: String = ""
 
     var autoApplyOnScreenChange: Bool {
         get { menuState.autoApplyOnScreenChange }
@@ -49,6 +86,7 @@ final class Orchestrator: ObservableObject {
         scheduleAfter: @escaping (TimeInterval, @escaping () -> Void) -> Void = { delay, action in
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action)
         },
+        powerMonitor: PowerStateMonitor = PowerStateMonitor(),
         enableAppLaunchObserver: Bool = true,
         enableAutoSaveTimer: Bool = true
     ) {
@@ -90,6 +128,7 @@ final class Orchestrator: ObservableObject {
         self.isAccessibilityTrusted = isAccessibilityTrusted
         self.requestAccessibilityAccess = requestAccessibilityAccess
         self.scheduleAfter = scheduleAfter
+        self.powerMonitor = powerMonitor
 
         resolvedSnapBarController.onSnap = { [weak self] in
             self?.autoSaveCurrentLayout(trigger: .snapBar)
@@ -124,7 +163,7 @@ final class Orchestrator: ObservableObject {
 
         let result = ruleApplyService.applyAllRules()
         lastAction = result.statusMessage
-        Log.rule.info("\(self.lastAction, privacy: .public)")
+        Log.rule.info(self.lastAction)
     }
 
     func saveCurrentLayout() {
@@ -148,9 +187,109 @@ final class Orchestrator: ObservableObject {
         screenDetector.onScreensChanged
             .sink { [weak self] newProfileKey in
                 guard let self, self.menuState.autoApplyOnScreenChange else { return }
-                self.handleScreenChange(newProfileKey: newProfileKey)
+                self.routeScreenChange(newProfileKey: newProfileKey)
             }
             .store(in: &cancellables)
+
+        // After resume, enter an adaptive wake-settle window that uses the
+        // pre-suspend profile as its heuristic target.
+        powerMonitor.onResumed
+            .sink { [weak self] in
+                guard let self, self.menuState.autoApplyOnScreenChange else { return }
+                self.enterWakeSettleWindow()
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Top-level gate for screen reconfig events.
+    ///
+    /// - Suspended → drop entirely; restore happens once after resume.
+    /// - In wake-settle window → hand off to the state machine below.
+    /// - Otherwise → run inline (historical behavior).
+    func routeScreenChange(newProfileKey: String) {
+        if powerMonitor.isSuspended {
+            Log.screen.info("Screen change ignored: system suspended (profile=\(newProfileKey))")
+            return
+        }
+        if isInWakeSettleWindow {
+            handleScreenChangeInWakeSettle(newProfileKey: newProfileKey)
+            return
+        }
+        handleScreenChange(newProfileKey: newProfileKey)
+    }
+
+    func enterWakeSettleWindow() {
+        let expected = screenSessionService.previousProfileKey
+        Log.screen.info("Power: resumed — entering wake-settle window (expected=\(expected))")
+        isInWakeSettleWindow = true
+        wakeSettleStage = .awaitingFirstRestore
+        wakeSettleExpectedKey = expected
+        wakeSettleLastRestoredKey = ""
+        armWakeSettleTimer()
+    }
+
+    private func handleScreenChangeInWakeSettle(newProfileKey: String) {
+        switch wakeSettleStage {
+        case .awaitingFirstRestore:
+            if !wakeSettleExpectedKey.isEmpty, newProfileKey == wakeSettleExpectedKey {
+                Log.screen.info("Wake-settle: matched expected profile, restoring early (profile=\(newProfileKey))")
+                restoreInWakeSettle(profileKey: newProfileKey)
+            } else {
+                Log.screen.info("Wake-settle: awaiting expected (have=\(newProfileKey) want=\(self.wakeSettleExpectedKey)) — re-arm")
+                armWakeSettleTimer()
+            }
+
+        case .awaitingExit:
+            // Drift back to the heuristic target → re-restore. The expected key
+            // can't be empty here (otherwise we never set lastRestoredKey to it),
+            // but the comparison still has to gate on lastRestored to avoid a
+            // pointless second restore to the same target.
+            if !wakeSettleExpectedKey.isEmpty,
+               newProfileKey == wakeSettleExpectedKey,
+               wakeSettleLastRestoredKey != wakeSettleExpectedKey {
+                Log.screen.info("Wake-settle cooldown: profile drifted back to expected — re-restoring")
+                restoreInWakeSettle(profileKey: newProfileKey)
+            } else {
+                // Either an echo of the last restored profile or a transient
+                // flicker; absorb it and re-arm the cooldown.
+                Log.screen.info("Wake-settle cooldown: absorbing event (profile=\(newProfileKey) lastRestored=\(self.wakeSettleLastRestoredKey))")
+                armWakeSettleTimer()
+            }
+        }
+    }
+
+    private func restoreInWakeSettle(profileKey: String) {
+        handleScreenChange(newProfileKey: profileKey)
+        wakeSettleLastRestoredKey = profileKey
+        wakeSettleStage = .awaitingExit
+        armWakeSettleTimer()
+    }
+
+    private func armWakeSettleTimer() {
+        wakeSettleGeneration &+= 1
+        let myGeneration = wakeSettleGeneration
+        let stage = wakeSettleStage
+        let delay: TimeInterval = stage == .awaitingFirstRestore
+            ? Constants.Timing.wakeSettleDelay
+            : Constants.Timing.wakeSettleCooldownDelay
+
+        scheduleAfter(delay) { [weak self] in
+            guard let self else { return }
+            // Stale generation? A newer event re-armed; this closure is dead.
+            guard self.wakeSettleGeneration == myGeneration else { return }
+
+            switch stage {
+            case .awaitingFirstRestore:
+                // Heuristic never matched within the timeout — best-effort restore
+                // against whatever the detector currently reports.
+                let key = self.screenDetector.profileKey
+                Log.screen.info("Wake-settle timeout: restoring against current profile=\(key)")
+                self.restoreInWakeSettle(profileKey: key)
+            case .awaitingExit:
+                Log.screen.info("Wake-settle cooldown elapsed — exiting wake-settle window")
+                self.isInWakeSettleWindow = false
+            }
+        }
     }
 
     func handleScreenChange(newProfileKey: String) {

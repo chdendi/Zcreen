@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct FooterSection: View {
     @ObservedObject var updater: AutoUpdater
@@ -10,6 +11,10 @@ struct FooterSection: View {
 
             HStack(spacing: 0) {
                 footerButton("About") { showAbout() }
+
+                footerDot
+
+                footerButton("Logs") { revealLogs() }
 
                 Spacer()
 
@@ -54,10 +59,14 @@ struct FooterSection: View {
             .padding(.horizontal, 6)
     }
 
+    private func revealLogs() {
+        NSWorkspace.shared.activateFileViewerSelecting([FileLogSink.shared.directoryURL])
+    }
+
     private func showAbout() {
         let alert = NSAlert()
         alert.messageText = "Zcreen"
-        alert.informativeText = "Version 1.0.3\n\nMulti-screen window manager for macOS.\nAutomatically saves and restores window layouts when screens change.\n\nNo configuration needed \u{2014} just plug/unplug your displays."
+        alert.informativeText = "Version 1.2.0\n\nMulti-screen window manager for macOS.\nAutomatically saves and restores window layouts when screens change.\n\nNo configuration needed \u{2014} just plug/unplug your displays."
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()

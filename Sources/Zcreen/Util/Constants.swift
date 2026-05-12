@@ -40,6 +40,15 @@ enum Constants {
     enum Timing {
         /// 屏幕变化 throttle 间隔 (ms)，begin/settle 状态机后 latest-event 触发延迟。
         static let screenChangeDebounceMs: Int = 100
+        /// 系统从 sleep / lock 唤醒后等待"期望 profile"重新出现的 debounce 超时 (s)。
+        /// 唤醒时 macOS 会按显示器逐块发送 reconfig 事件（在多屏 + 外接屏环境中
+        /// 间隔可达数秒），自适应状态机用 expectedProfileKey 启发匹配 + 这个 timeout
+        /// 兜底；只要在 timeout 内匹配到 expected profile 就立即 restore。
+        static let wakeSettleDelay: TimeInterval = 8.0
+        /// 第一次 restore 后再要求 N 秒静默才退出 wake-settle 窗口 (s)。
+        /// cooldown 期内的 reconfig 事件被吸收（不再 restore），只有 profile 漂回
+        /// expected 才会再次 restore。避免 macOS 反复抖动外接屏 mode 时窗口连跳。
+        static let wakeSettleCooldownDelay: TimeInterval = 4.0
         /// 定时自动保存布局间隔 (s)
         static let layoutAutoSaveInterval: TimeInterval = 15
         /// 屏幕变化后延迟保存当前布局 (s) — 给用户更长的手动调整窗口期。

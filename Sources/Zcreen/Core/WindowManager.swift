@@ -106,21 +106,132 @@ class WindowManager {
         getWindows(bundleId: bundleId).filter(filter.allows(window:))
     }
 
-    func moveWindow(_ window: AXUIElement, to point: CGPoint) {
+    @discardableResult
+    func moveWindow(_ window: AXUIElement, to point: CGPoint) -> AXError {
         var position = point
         let positionValue = AXValueCreate(.cgPoint, &position)!
-        AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, positionValue)
+        let err = AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, positionValue)
+        if err != .success {
+            Log.window.warning("AX setPosition(\(point.x), \(point.y)) failed: \(err.rawValue)")
+        }
+        return err
     }
 
-    func resizeWindow(_ window: AXUIElement, to size: CGSize) {
+    @discardableResult
+    func resizeWindow(_ window: AXUIElement, to size: CGSize) -> AXError {
         var sz = size
         let sizeValue = AXValueCreate(.cgSize, &sz)!
-        AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
+        let err = AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
+        if err != .success {
+            Log.window.warning("AX setSize(\(size.width), \(size.height)) failed: \(err.rawValue)")
+        }
+        return err
     }
 
+    /// 多段式 set：size → position → size → position；末尾留 setPosition，避免某些 app
+    /// 在收到 resize 通知后内部 layout 把 position attribute 又 reset 回去。
+    /// 第一轮后如果实际 frame 偏差仍 >5pt，做一次反向兜底（position → size → position）。
     func moveWindow(_ window: AXUIElement, toFrame frame: CGRect) {
-        moveWindow(window, to: frame.origin)
-        resizeWindow(window, to: frame.size)
+        let originalFrame = getWindowFrame(window)
+
+        withEnhancedUserInterfaceDisabled(for: window) {
+            // Pass 1: size-first，收尾 position
+            resizeWindow(window, to: frame.size)
+            moveWindow(window, to: frame.origin)
+            resizeWindow(window, to: frame.size)
+            moveWindow(window, to: frame.origin)
+
+            // 校验中间状态，如有明显偏差就以 position-first 的顺序再来一次
+            if let mid = getWindowFrame(window) {
+                let needsRetry = max(
+                    abs(mid.origin.x - frame.origin.x),
+                    abs(mid.origin.y - frame.origin.y),
+                    abs(mid.width - frame.width),
+                    abs(mid.height - frame.height)
+                ) > 5
+                if needsRetry {
+                    moveWindow(window, to: frame.origin)
+                    resizeWindow(window, to: frame.size)
+                    moveWindow(window, to: frame.origin)
+                }
+            }
+
+            // Grid 对齐 app（Ghostty / iTerm 等终端按字符尺寸对齐，部分 IDE 同理）
+            // 会拒绝 setSize 到任意像素尺寸，size 改不动 → setPosition 的目标 y 又
+            // 因实际 size 撑不下被边界 clamp，最后变成"贴边"而不是"居中"。
+            // 兜底策略：如果实际 size 跟 target 差 >5pt，就用实际 size 居中到 target frame 中心。
+            if let actual = getWindowFrame(window) {
+                let sizeDiff = max(abs(actual.width - frame.width), abs(actual.height - frame.height))
+                if sizeDiff > 5 {
+                    let centeredOrigin = CGPoint(
+                        x: frame.midX - actual.width / 2,
+                        y: frame.midY - actual.height / 2
+                    )
+                    if abs(centeredOrigin.x - actual.origin.x) > 1 || abs(centeredOrigin.y - actual.origin.y) > 1 {
+                        moveWindow(window, to: centeredOrigin)
+                    }
+                }
+            }
+        }
+
+        // 最终校验，如果偏差仍 >10pt 记一条 warning 便于复盘
+        if let actual = getWindowFrame(window) {
+            let dx = abs(actual.origin.x - frame.origin.x)
+            let dy = abs(actual.origin.y - frame.origin.y)
+            let dw = abs(actual.width - frame.width)
+            let dh = abs(actual.height - frame.height)
+            if max(dx, dy, dw, dh) > 10 {
+                let from = originalFrame.map { "(\($0.origin.x), \($0.origin.y), \($0.width), \($0.height))" } ?? "?"
+                let appLabel = appDescription(for: window)
+                Log.window.warning(
+                    "moveWindow drift [\(appLabel)]: "
+                    + "from \(from) "
+                    + "target (\(frame.origin.x), \(frame.origin.y), \(frame.width), \(frame.height)) "
+                    + "actual (\(actual.origin.x), \(actual.origin.y), \(actual.width), \(actual.height)) "
+                    + "drift dx=\(dx) dy=\(dy) dw=\(dw) dh=\(dh)"
+                )
+            }
+        }
+    }
+
+    /// 一些 app（Office、部分自渲染 app、终端等）会注入 enhanced UI 包装层，
+    /// 拦截 / 改写 setSize/setPosition。临时把 app 的 AXEnhancedUserInterface 设为 false
+    /// 可绕过包装层。Rectangle / yabai / Magnet 等通用做法。
+    /// 私有 attribute 名 "AXEnhancedUserInterface"。无副作用：操作完恢复原值。
+    private func withEnhancedUserInterfaceDisabled(for window: AXUIElement, _ work: () -> Void) {
+        var pid: pid_t = 0
+        AXUIElementGetPid(window, &pid)
+        guard pid > 0 else { work(); return }
+        let app = AXUIElementCreateApplication(pid)
+        let attr = "AXEnhancedUserInterface" as CFString
+
+        var originalRef: CFTypeRef?
+        let readErr = AXUIElementCopyAttributeValue(app, attr, &originalRef)
+        let wasEnabled: Bool
+        if readErr == .success,
+           let cf = originalRef,
+           CFGetTypeID(cf) == CFBooleanGetTypeID() {
+            wasEnabled = CFBooleanGetValue((cf as! CFBoolean))
+        } else {
+            wasEnabled = false
+        }
+
+        if wasEnabled {
+            AXUIElementSetAttributeValue(app, attr, kCFBooleanFalse)
+        }
+        work()
+        if wasEnabled {
+            AXUIElementSetAttributeValue(app, attr, kCFBooleanTrue)
+        }
+    }
+
+    /// 取一段简洁的 app + 标题描述用于日志，便于定位是哪个 app 在抗拒 set frame。
+    private func appDescription(for window: AXUIElement) -> String {
+        var pid: pid_t = 0
+        AXUIElementGetPid(window, &pid)
+        let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid=\(pid)"
+        let title = getWindowTitle(window).map { String($0.prefix(40)) } ?? "?"
+        return "\(appName) — \(title)"
     }
 
     func moveWindowToScreen(_ window: AXUIElement, currentFrame: CGRect, targetScreen: ScreenInfo) {

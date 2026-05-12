@@ -192,6 +192,137 @@ final class OrchestratorTests: XCTestCase {
         XCTAssertEqual(snapshotStore.saveCallCount, 1)
     }
 
+    func testRouteScreenChangeIsSuppressedWhileSuspended() {
+        let oldScreen = makeScreen(displayID: 1, name: "Built-in Retina Display", frame: CGRect(x: 0, y: 0, width: 1512, height: 982))
+        let detector = makeScreenDetector(screen: oldScreen, profileKey: "old-profile", profileLabel: "Old")
+        let configManager = ConfigManager(loadFromDisk: false, configDirectory: tempDirectory())
+        let snapshotStore = TestSnapshotStore()
+        let scheduler = TestScheduler()
+        let powerMonitor = PowerStateMonitor(observe: false)
+        snapshotStore.storedSnapshots["transient"] = makeLayoutSnapshot(profileKey: "transient", profileLabel: "Transient", titles: ["Restored"])
+
+        let orchestrator = makeOrchestrator(
+            screenDetector: detector,
+            configManager: configManager,
+            snapshotStore: snapshotStore,
+            scheduler: scheduler,
+            powerMonitor: powerMonitor
+        )
+
+        powerMonitor.simulateScreenLocked(true)
+        orchestrator.routeScreenChange(newProfileKey: "transient")
+
+        XCTAssertEqual(snapshotStore.restoreCallCount, 0, "Suspended state must not trigger restores")
+        XCTAssertEqual(scheduler.delays, [], "No autosave should be scheduled either")
+    }
+
+    func testWakeSettleRestoresEarlyWhenProfileMatchesPreSuspendKey() {
+        // Pre-suspend profile is "stable" (3-screen). After resume we see two
+        // transient profiles before macOS finishes bringing back all displays;
+        // when the detector finally exposes the "stable" key the heuristic
+        // should fire restore immediately rather than waiting for the timeout.
+        let initialScreen = makeScreen(displayID: 1, name: "Built-in", frame: CGRect(x: 0, y: 0, width: 1512, height: 982))
+        let detector = makeScreenDetector(screen: initialScreen, profileKey: "stable", profileLabel: "Stable")
+        let snapshotStore = TestSnapshotStore()
+        let scheduler = TestScheduler()
+        let powerMonitor = PowerStateMonitor(observe: false)
+        snapshotStore.storedSnapshots["stable"] = makeLayoutSnapshot(profileKey: "stable", profileLabel: "Stable", titles: ["W"])
+
+        let orchestrator = makeOrchestrator(
+            screenDetector: detector,
+            configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()),
+            snapshotStore: snapshotStore,
+            scheduler: scheduler,
+            powerMonitor: powerMonitor
+        )
+
+        powerMonitor.simulateScreenLocked(true)
+        powerMonitor.simulateScreenLocked(false)
+
+        // Initial debounce timer scheduled.
+        XCTAssertEqual(scheduler.delays, [Constants.Timing.wakeSettleDelay])
+        XCTAssertEqual(snapshotStore.restoreCallCount, 0)
+
+        // Two transient events that don't match expected — re-arm only.
+        orchestrator.routeScreenChange(newProfileKey: "transient-1")
+        orchestrator.routeScreenChange(newProfileKey: "transient-2")
+        XCTAssertEqual(snapshotStore.restoreCallCount, 0)
+        XCTAssertEqual(scheduler.delays.count, 3, "Each non-match re-arms initial debounce")
+
+        // Profile drifts back to expected — should restore immediately, no wait.
+        orchestrator.routeScreenChange(newProfileKey: "stable")
+        XCTAssertEqual(snapshotStore.restoreCallCount, 1, "Heuristic match must restore immediately")
+        XCTAssertEqual(orchestrator.lastAction, "Restored layout for Stable")
+
+        // Restore transitions to cooldown — last delay queued is the cooldown timer.
+        XCTAssertEqual(scheduler.delays.last, Constants.Timing.wakeSettleCooldownDelay)
+    }
+
+    func testWakeSettleCooldownAbsorbsTransientsButReRestoresOnDriftBack() {
+        let initialScreen = makeScreen(displayID: 1, name: "Built-in", frame: CGRect(x: 0, y: 0, width: 1512, height: 982))
+        let detector = makeScreenDetector(screen: initialScreen, profileKey: "stable", profileLabel: "Stable")
+        let snapshotStore = TestSnapshotStore()
+        let scheduler = TestScheduler()
+        let powerMonitor = PowerStateMonitor(observe: false)
+        snapshotStore.storedSnapshots["stable"] = makeLayoutSnapshot(profileKey: "stable", profileLabel: "Stable", titles: ["W"])
+        snapshotStore.storedSnapshots["partial"] = makeLayoutSnapshot(profileKey: "partial", profileLabel: "Partial", titles: ["P"])
+
+        let orchestrator = makeOrchestrator(
+            screenDetector: detector,
+            configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()),
+            snapshotStore: snapshotStore,
+            scheduler: scheduler,
+            powerMonitor: powerMonitor
+        )
+
+        powerMonitor.simulateScreenLocked(true)
+        powerMonitor.simulateScreenLocked(false)
+
+        // Drive into cooldown via heuristic match.
+        orchestrator.routeScreenChange(newProfileKey: "stable")
+        XCTAssertEqual(snapshotStore.restoreCallCount, 1)
+
+        // Transient flicker in cooldown — must be absorbed (no restore).
+        orchestrator.routeScreenChange(newProfileKey: "partial")
+        XCTAssertEqual(snapshotStore.restoreCallCount, 1, "Cooldown must absorb non-expected transients")
+
+        // Echo of the last restored profile — also absorbed (no duplicate restore).
+        orchestrator.routeScreenChange(newProfileKey: "stable")
+        XCTAssertEqual(snapshotStore.restoreCallCount, 1, "Cooldown echo must not duplicate the restore")
+    }
+
+    func testWakeSettleTimeoutRestoresAgainstWhateverDetectorReports() {
+        // Pre-suspend was "stable" but after resume the matching profile never
+        // returns within the timeout — we should still restore once against the
+        // current profile so windows aren't left in their transient layout.
+        let initialScreen = makeScreen(displayID: 1, name: "Built-in", frame: CGRect(x: 0, y: 0, width: 1512, height: 982))
+        let detector = makeScreenDetector(screen: initialScreen, profileKey: "stable", profileLabel: "Stable")
+        let snapshotStore = TestSnapshotStore()
+        let scheduler = TestScheduler()
+        let powerMonitor = PowerStateMonitor(observe: false)
+        snapshotStore.storedSnapshots["fallback"] = makeLayoutSnapshot(profileKey: "fallback", profileLabel: "Fallback", titles: ["F"])
+
+        let orchestrator = makeOrchestrator(
+            screenDetector: detector,
+            configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()),
+            snapshotStore: snapshotStore,
+            scheduler: scheduler,
+            powerMonitor: powerMonitor
+        )
+
+        powerMonitor.simulateScreenLocked(true)
+        powerMonitor.simulateScreenLocked(false)
+
+        // Detector now reports the fallback profile — but no event matches
+        // the pre-suspend "stable" key. The timeout closure should fire and
+        // restore against this current profile.
+        detector.setStateForTesting(screens: [initialScreen], profileKey: "fallback", profileLabel: "Fallback")
+        scheduler.runAll()
+
+        XCTAssertEqual(snapshotStore.restoreCallCount, 1, "Timeout must do best-effort restore")
+        XCTAssertEqual(orchestrator.lastAction, "Restored layout for Fallback")
+    }
+
     func testManualRestoreReportsMissingSnapshot() {
         let screen = makeScreen()
         let detector = makeScreenDetector(screen: screen, profileKey: "main-profile", profileLabel: "Main")
@@ -301,7 +432,8 @@ final class OrchestratorTests: XCTestCase {
         windowManager: WindowManager = TestWindowManager(),
         snapshotStore: LayoutSnapshotStore,
         scheduler: TestScheduler? = nil,
-        settingsStore: MenuSettingsStore? = nil
+        settingsStore: MenuSettingsStore? = nil,
+        powerMonitor: PowerStateMonitor = PowerStateMonitor(observe: false)
     ) -> Orchestrator {
         let runLoopScheduler = scheduler ?? TestScheduler()
         let resolvedSettingsStore = settingsStore ?? MenuSettingsStore(defaults: temporaryUserDefaults())
@@ -318,6 +450,7 @@ final class OrchestratorTests: XCTestCase {
             scheduleAfter: { delay, action in
                 runLoopScheduler.schedule(after: delay, action)
             },
+            powerMonitor: powerMonitor,
             enableAppLaunchObserver: false,
             enableAutoSaveTimer: false
         )

@@ -117,7 +117,7 @@ final class SnapshotService {
             windowFilter: currentWindowFilter()
         )
         let message = successLogMessage(snapshot)
-        Log.snapshot.info("\(message, privacy: .public)")
+        Log.snapshot.info(message)
         return .restored(profileLabel: snapshot.profileLabel)
     }
 

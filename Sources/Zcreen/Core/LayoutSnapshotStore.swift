@@ -8,6 +8,12 @@ class LayoutSnapshotStore: ObservableObject {
     private let snapshotDir: URL
     private var cache: [String: LayoutSnapshot] = [:]
     private weak var screenDetector: ScreenDetector?
+    /// Generation token for in-flight restore retry chains. Each top-level
+    /// `restoreSnapshot` call bumps this; queued retry closures check that the
+    /// generation still matches before running, so a fresh restore (e.g. triggered
+    /// by another screen change while displays were still settling) cancels the
+    /// previous chain instead of stacking moves on top.
+    private var restoreGeneration: UInt64 = 0
 
     init(snapshotDirectory: URL? = nil, loadExisting: Bool = true, screenDetector: ScreenDetector? = nil) {
         let configDir = snapshotDirectory ?? FileManager.default.homeDirectoryForCurrentUser
@@ -96,13 +102,15 @@ class LayoutSnapshotStore: ObservableObject {
 
     func restoreSnapshot(_ snapshot: LayoutSnapshot, windowManager: WindowManager, excludeBundleIds: Set<String>,
                          windowFilter: WindowFilter) {
+        restoreGeneration &+= 1
+        let generation = restoreGeneration
         let missed = doRestore(snapshot: snapshot, windowManager: windowManager,
                                excludeBundleIds: excludeBundleIds, windowFilter: windowFilter)
 
         if !missed.isEmpty {
             scheduleRetry(snapshot: snapshot, windowManager: windowManager,
                           excludeBundleIds: excludeBundleIds, windowFilter: windowFilter,
-                          missed: missed, attempt: 1)
+                          missed: missed, attempt: 1, generation: generation)
         }
     }
 
@@ -110,10 +118,15 @@ class LayoutSnapshotStore: ObservableObject {
 
     private func scheduleRetry(snapshot: LayoutSnapshot, windowManager: WindowManager,
                                excludeBundleIds: Set<String>, windowFilter: WindowFilter,
-                               missed: [String], attempt: Int) {
+                               missed: [String], attempt: Int, generation: UInt64) {
         let maxRetries = Constants.Timing.snapshotMaxRetries
         guard attempt <= maxRetries else {
             Log.snapshot.info("RESTORE: gave up after \(maxRetries) retries, \(missed.count) apps still inaccessible")
+            return
+        }
+        // A newer restore has started — abandon this chain instead of fighting it.
+        guard generation == restoreGeneration else {
+            Log.snapshot.info("RESTORE: aborting stale retry chain (gen=\(generation) current=\(self.restoreGeneration))")
             return
         }
 
@@ -122,14 +135,20 @@ class LayoutSnapshotStore: ObservableObject {
         Log.snapshot.info("RESTORE: \(missed.count) apps missed, retry \(attempt)/\(maxRetries) in \(delay)s...")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            let stillMissed = self?.doRestore(snapshot: snapshot, windowManager: windowManager,
+            guard let self else { return }
+            guard generation == self.restoreGeneration else {
+                Log.snapshot.info("RESTORE: skipping retry, superseded by gen=\(self.restoreGeneration)")
+                return
+            }
+            let stillMissed = self.doRestore(snapshot: snapshot, windowManager: windowManager,
                                              excludeBundleIds: excludeBundleIds,
-                                             windowFilter: windowFilter) ?? []
+                                             windowFilter: windowFilter)
             if !stillMissed.isEmpty {
-                self?.scheduleRetry(snapshot: snapshot, windowManager: windowManager,
-                                    excludeBundleIds: excludeBundleIds,
-                                    windowFilter: windowFilter,
-                                    missed: stillMissed, attempt: attempt + 1)
+                self.scheduleRetry(snapshot: snapshot, windowManager: windowManager,
+                                   excludeBundleIds: excludeBundleIds,
+                                   windowFilter: windowFilter,
+                                   missed: stillMissed, attempt: attempt + 1,
+                                   generation: generation)
             }
         }
     }

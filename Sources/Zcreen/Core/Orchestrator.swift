@@ -191,6 +191,15 @@ final class Orchestrator: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // The begin pulse arrives before macOS starts rearranging windows, so this
+        // save captures the last user-arranged layout under the still-current
+        // profile — closing the up-to-15s gap since the previous periodic save.
+        screenDetector.onBeginConfiguration
+            .sink { [weak self] in
+                self?.handleScreenWillChange()
+            }
+            .store(in: &cancellables)
+
         // After resume, enter an adaptive wake-settle window that uses the
         // pre-suspend profile as its heuristic target.
         powerMonitor.onResumed
@@ -286,10 +295,25 @@ final class Orchestrator: ObservableObject {
                 Log.screen.info("Wake-settle timeout: restoring against current profile=\(key)")
                 self.restoreInWakeSettle(profileKey: key)
             case .awaitingExit:
-                Log.screen.info("Wake-settle cooldown elapsed — exiting wake-settle window")
-                self.isInWakeSettleWindow = false
+                // Cooldown may have absorbed a genuine change (e.g. a display plugged
+                // in mid-cooldown). If the detector's profile no longer matches what
+                // we last restored, restore once more instead of exiting stale.
+                let current = self.screenDetector.profileKey
+                if !current.isEmpty, current != self.wakeSettleLastRestoredKey {
+                    Log.screen.info("Wake-settle cooldown elapsed with drifted profile (\(current)) — restoring before exit")
+                    self.restoreInWakeSettle(profileKey: current)
+                } else {
+                    Log.screen.info("Wake-settle cooldown elapsed — exiting wake-settle window")
+                    self.isInWakeSettleWindow = false
+                }
             }
         }
+    }
+
+    /// Best-effort save of the current (pre-change) profile the moment a display
+    /// reconfiguration is announced, while windows are still where the user left them.
+    func handleScreenWillChange() {
+        autoSaveCurrentLayout(trigger: .screenWillChange)
     }
 
     func handleScreenChange(newProfileKey: String) {
@@ -357,6 +381,13 @@ final class Orchestrator: ObservableObject {
     }
 
     private func autoSaveCurrentLayout(trigger: SnapshotService.Trigger) {
+        // Never persist layouts while the system is suspended (sleep/lock) or still
+        // settling after wake — captures taken in those windows are the transitional
+        // states macOS produces mid-reconfig, and saving them overwrites good snapshots.
+        if powerMonitor.isSuspended || isInWakeSettleWindow {
+            Log.snapshot.info("Skipped snapshot save [\(trigger.logLabel)]: system suspended or settling after wake")
+            return
+        }
         guard ensureAccessibilityPermission(promptIfNeeded: false) else { return }
         _ = snapshotService.saveCurrentLayout(trigger: trigger, force: false)
     }

@@ -6,6 +6,7 @@ final class SnapshotService {
         case periodic
         case snapBar = "snap_bar"
         case screenChange = "screen_change"
+        case screenWillChange = "screen_will_change"
         case appLaunch = "app_launch"
 
         var logLabel: String { rawValue }
@@ -58,7 +59,7 @@ final class SnapshotService {
     }
 
     func saveCurrentLayout(trigger: Trigger, force: Bool) -> SaveResult {
-        let snapshot = snapshotStore.captureSnapshot(
+        let captured = snapshotStore.captureSnapshot(
             profileKey: screenSession.currentProfileKey,
             profileLabel: screenSession.currentProfileLabel,
             windowManager: windowManager,
@@ -66,13 +67,16 @@ final class SnapshotService {
             windowFilter: currentWindowFilter()
         )
 
-        guard !snapshot.windows.isEmpty else {
+        guard !captured.windows.isEmpty else {
             Log.snapshot.info("Skipped snapshot save [\(trigger.logLabel)] because no windows were captured")
             return .noWindows
         }
 
+        let existing = snapshotStore.load(profileKey: captured.profileKey)
+        let snapshot = merging(captured: captured, into: existing)
+
         if !force,
-           let existing = snapshotStore.load(profileKey: snapshot.profileKey),
+           let existing,
            existing.windows == snapshot.windows {
             Log.snapshot.info("Skipped snapshot save [\(trigger.logLabel)] because layout is unchanged")
             return .unchanged
@@ -81,6 +85,27 @@ final class SnapshotService {
         snapshotStore.save(snapshot: snapshot)
         Log.snapshot.info("Saved snapshot [\(trigger.logLabel)] for '\(snapshot.profileLabel)'")
         return .saved(windowCount: snapshot.windows.count)
+    }
+
+    /// AX occasionally returns zero windows for individual apps (busy, mid-launch,
+    /// lock-screen edge). Overwriting the stored snapshot with such a capture would
+    /// permanently lose those apps' saved positions, so entries for apps that exist
+    /// in the stored snapshot but are entirely absent from this capture are carried
+    /// over. Apps present in the capture are always taken as-is.
+    private func merging(captured: LayoutSnapshot, into existing: LayoutSnapshot?) -> LayoutSnapshot {
+        guard let existing else { return captured }
+
+        let capturedBundleIds = Set(captured.windows.map(\.bundleId))
+        let preserved = existing.windows.filter { !capturedBundleIds.contains($0.bundleId) }
+        guard !preserved.isEmpty else { return captured }
+
+        Log.snapshot.info("Snapshot merge preserved \(preserved.count) windows from apps missing in this capture")
+        return LayoutSnapshot(
+            profileKey: captured.profileKey,
+            profileLabel: captured.profileLabel,
+            timestamp: captured.timestamp,
+            windows: LayoutSnapshotStore.sortedForSnapshot(captured.windows + preserved)
+        )
     }
 
     func restoreCurrentLayout() -> RestoreResult {

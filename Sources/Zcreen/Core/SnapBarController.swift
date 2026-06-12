@@ -81,35 +81,19 @@ final class SnapBarController: ObservableObject {
         wasMouseDown = mouseDown
     }
 
-    // MARK: - Mouse Down: check if click is in a window's title bar
+    // MARK: - Mouse Down: resolve the window under the mouse
 
     private func onMouseDown(_ mouse: NSPoint) {
-        // 先做所有 "获取信息" 的 guard，全部成功后再修改状态。
-        // 任何 guard fail 都不会留下副作用（dragState 仍为 .idle，仍处于低频轮询）。
-        guard let app = NSWorkspace.shared.frontmostApplication,
-              app.bundleIdentifier != Bundle.main.bundleIdentifier,
-              app.activationPolicy == .regular
-        else { return }
-
-        let appEl = AXUIElementCreateApplication(app.processIdentifier)
-        guard let win = focusedWindow(of: appEl) ?? firstWindow(of: appEl) else { return }
-        guard let wFrame = windowFrame(win) else { return }
-        guard let mainScreenFrame = CoordinateConverter.mainScreenFrame(from: NSScreen.screens.map(\.frame)) else { return }
-
-        let mouseAX = CoordinateConverter.nsToAccessibility(mouse, mainScreenFrame: mainScreenFrame)
-        let pad = Constants.SnapBar.titleBarPadding
-        let titleBar = CGRect(x: wFrame.origin.x - pad,
-                              y: wFrame.origin.y - pad,
-                              width: wFrame.width + pad * 2,
-                              height: Constants.SnapBar.titleBarHeight)
-
-        // 进入 tracking 才切高频，避免没目标窗口也升频空转
+        // 无论是否立刻解析到目标都进入 tracking：点击背景窗口时 app 激活与 AX
+        // 焦点更新是异步的，mouseDown 边沿这一个 tick 上经常解析失败或解析到
+        // 旧窗口；tracking 期间会周期性重试，直到命中标题栏或超时。
         switchToHighFrequency()
         dragState = .tracking
         tickCount = 0
         initialMousePos = mouse
-        targetWindow = win
-        clickedTitleBar = titleBar.contains(mouseAX)
+        targetWindow = nil
+        clickedTitleBar = false
+        applyResolvedTarget(resolveDragTarget(at: mouse))
     }
 
     // MARK: - Drag tick: detect significant mouse movement from title bar
@@ -122,14 +106,22 @@ final class SnapBarController: ObservableObject {
         case .tracking:
             tickCount += 1
 
-            guard clickedTitleBar, let initial = initialMousePos else {
-                if tickCount >= Constants.SnapBar.trackingTimeoutTicks {
-                    dragState = .idle
-                    switchToLowFrequency()
+            if !clickedTitleBar {
+                // 目标未命中标题栏：周期性重试解析，等待 app 激活 / AX 状态落定。
+                // 一旦命中就锁定目标，不再重新解析。
+                if tickCount % Constants.SnapBar.targetResolveRetryTicks == 0 {
+                    applyResolvedTarget(resolveDragTarget(at: mouse))
                 }
-                return
+                if !clickedTitleBar {
+                    if tickCount >= Constants.SnapBar.trackingTimeoutTicks {
+                        dragState = .idle
+                        switchToLowFrequency()
+                    }
+                    return
+                }
             }
 
+            guard let initial = initialMousePos else { return }
             let moved = hypot(mouse.x - initial.x, mouse.y - initial.y)
             if moved > Constants.SnapBar.dragThreshold {
                 dragState = .snapping
@@ -148,6 +140,102 @@ final class SnapBarController: ObservableObject {
             }
 
         }
+    }
+
+    // MARK: - Drag target resolution
+
+    private struct DragTarget {
+        let window: AXUIElement
+        let inTitleBar: Bool
+    }
+
+    private func applyResolvedTarget(_ target: DragTarget?) {
+        guard let target else { return }
+        targetWindow = target.window
+        clickedTitleBar = target.inTitleBar
+    }
+
+    /// 用系统级 AX hit-test 找鼠标正下方的窗口。旧实现用 frontmostApplication +
+    /// focusedWindow 推断，只在"拖当前激活 app 的聚焦窗口"时正确——点击背景窗口
+    /// 标题栏直接拖动时会解析到错误窗口，导致整个拖拽期间面板不出现。
+    private func resolveDragTarget(at mouse: NSPoint) -> DragTarget? {
+        guard let mainScreenFrame = CoordinateConverter.mainScreenFrame(from: NSScreen.screens.map(\.frame)) else { return nil }
+        let mouseAX = CoordinateConverter.nsToAccessibility(mouse, mainScreenFrame: mainScreenFrame)
+
+        guard let win = windowAt(mouseAX) ?? frontmostFocusedWindow() else {
+            Log.general.debug("Snap Bar: no window resolved at (\(mouseAX.x), \(mouseAX.y))")
+            return nil
+        }
+        guard isSnappable(win), let wFrame = windowFrame(win) else { return nil }
+
+        let pad = Constants.SnapBar.titleBarPadding
+        let titleBar = CGRect(x: wFrame.origin.x - pad,
+                              y: wFrame.origin.y - pad,
+                              width: wFrame.width + pad * 2,
+                              height: Constants.SnapBar.titleBarHeight)
+        return DragTarget(window: win, inTitleBar: titleBar.contains(mouseAX))
+    }
+
+    /// 系统级 hit-test：取鼠标下的 AX 元素，再取其所属窗口（kAXWindowAttribute，
+    /// 个别元素不带该属性时沿 parent 链向上找 AXWindow）。
+    private func windowAt(_ pointAX: CGPoint) -> AXUIElement? {
+        let systemWide = AXUIElementCreateSystemWide()
+        // 目标 app 无响应时 AX 调用默认可阻塞数秒，而这里跑在主线程轮询里，
+        // 必须限定超时避免拖死 UI。
+        AXUIElementSetMessagingTimeout(systemWide, Constants.SnapBar.axMessagingTimeout)
+        var elementRef: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(systemWide, Float(pointAX.x), Float(pointAX.y), &elementRef) == .success,
+              let element = elementRef
+        else { return nil }
+        AXUIElementSetMessagingTimeout(element, Constants.SnapBar.axMessagingTimeout)
+
+        var windowRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXWindowAttribute as CFString, &windowRef) == .success,
+           let window = windowRef, CFGetTypeID(window) == AXUIElementGetTypeID() {
+            return (window as! AXUIElement)
+        }
+
+        var current = element
+        for _ in 0..<10 {
+            if stringAttribute(current, kAXRoleAttribute as CFString) == kAXWindowRole as String {
+                return current
+            }
+            var parentRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &parentRef) == .success,
+                  let parent = parentRef, CFGetTypeID(parent) == AXUIElementGetTypeID()
+            else { return nil }
+            current = (parent as! AXUIElement)
+        }
+        return nil
+    }
+
+    /// hit-test 失败时的兜底：沿用旧的 frontmost + focused 推断。
+    private func frontmostFocusedWindow() -> AXUIElement? {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.bundleIdentifier != Bundle.main.bundleIdentifier,
+              app.activationPolicy == .regular
+        else { return nil }
+
+        let appEl = AXUIElementCreateApplication(app.processIdentifier)
+        return focusedWindow(of: appEl) ?? firstWindow(of: appEl)
+    }
+
+    /// 过滤不该被 snap 的窗口：自己的面板、非常规 app（Spotlight 等）、桌面 /
+    /// sheet 等非标准窗口。subrole 读不到时放行，避免误杀不规范 app 的主窗口。
+    private func isSnappable(_ win: AXUIElement) -> Bool {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(win, &pid) == .success,
+              pid != ProcessInfo.processInfo.processIdentifier
+        else { return false }
+        guard let app = NSRunningApplication(processIdentifier: pid),
+              app.activationPolicy == .regular
+        else { return false }
+
+        if let subrole = stringAttribute(win, kAXSubroleAttribute as CFString) {
+            return subrole == kAXStandardWindowSubrole as String
+                || subrole == kAXDialogSubrole as String
+        }
+        return true
     }
 
     // MARK: - Mouse Up: apply preset if highlighted
@@ -241,6 +329,12 @@ final class SnapBarController: ObservableObject {
         AXValueGetValue(posRef as! AXValue, .cgPoint, &pos)
         AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
         return CGRect(origin: pos, size: size)
+    }
+
+    private func stringAttribute(_ element: AXUIElement, _ attribute: CFString) -> String? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &ref) == .success else { return nil }
+        return ref as? String
     }
 
     private func screenAt(_ point: NSPoint) -> NSScreen? {

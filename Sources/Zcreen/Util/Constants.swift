@@ -17,6 +17,11 @@ enum Constants {
         static let snapSaveDelay: TimeInterval = 0.3
         /// Tracking 超时 tick 数 (高频 60Hz × 60 ≈ 1s，与原 4Hz × 5 等效)
         static let trackingTimeoutTicks: Int = 60
+        /// Tracking 期间目标窗口重试解析间隔 tick 数 (60Hz × 6 ≈ 100ms)，
+        /// 应对点击背景窗口时 app 激活 / AX 焦点更新的异步滞后
+        static let targetResolveRetryTicks: Int = 6
+        /// hit-test 相关 AX 调用的 messaging 超时 (s)，防止无响应 app 阻塞主线程轮询
+        static let axMessagingTimeout: Float = 0.25
     }
 
     enum Layout {

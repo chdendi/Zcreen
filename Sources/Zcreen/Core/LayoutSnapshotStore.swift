@@ -90,7 +90,7 @@ class LayoutSnapshotStore: ObservableObject {
                 windowSubrole: win.subrole
             )
         }
-        .sorted(by: compareWindowSnapshots)
+        .sorted(by: Self.compareWindowSnapshots)
 
         return LayoutSnapshot(
             profileKey: profileKey,
@@ -289,7 +289,13 @@ class LayoutSnapshotStore: ObservableObject {
         }
     }
 
-    private func compareWindowSnapshots(_ lhs: WindowSnapshot, _ rhs: WindowSnapshot) -> Bool {
+    /// Canonical ordering for snapshot windows, shared with merge logic so the
+    /// "unchanged" comparison stays stable regardless of how a window list was built.
+    static func sortedForSnapshot(_ windows: [WindowSnapshot]) -> [WindowSnapshot] {
+        windows.sorted(by: compareWindowSnapshots)
+    }
+
+    private static func compareWindowSnapshots(_ lhs: WindowSnapshot, _ rhs: WindowSnapshot) -> Bool {
         // Lexicographic order over a stable key tuple. Split into two tuples because Swift only
         // synthesizes Comparable for tuples up to 6 elements.
         let lKey1 = (lhs.bundleId, lhs.appName, lhs.windowTitle ?? "", lhs.windowRole ?? "", lhs.windowSubrole ?? "", lhs.screenName)

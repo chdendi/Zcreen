@@ -1,37 +1,31 @@
 # Zcreen
 
 <p align="center">
-  <a href="https://github.com/hgDendi/Zcreen/releases/latest">
-    <img src="https://img.shields.io/github/v/release/hgDendi/Zcreen?style=flat-square&color=blue" alt="Latest Release">
+  <a href="https://github.com/chdendi/Zcreen/releases/latest">
+    <img src="https://img.shields.io/github/v/release/chdendi/Zcreen?style=flat-square&color=blue" alt="Latest Release">
   </a>
   <img src="https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
   <a href="README.md">中文</a>
 </p>
 
-**Plug in your monitor, windows go back where they were.** No config, no shortcuts, nothing to remember.
+**Plug in your monitor, and your windows return to their last positions.** Zcreen remembers and restores layouts for each screen setup.
 
 <p align="center">
-  <a href="https://github.com/hgDendi/Zcreen/releases/latest">
-    <b>>>> Download Latest (DMG) <<<</b>
+  <a href="https://github.com/chdendi/Zcreen/releases/latest">
+    <b>Download Latest DMG</b>
   </a>
 </p>
 
 ---
-
-## The Problem
-
-Every morning you dock at the office: three monitors, all windows crammed onto the laptop screen. Five minutes dragging things back into place. Go home, different monitor — do it again.
-
-**Zcreen makes you arrange once.**
 
 ## Features
 
 ### 1. Auto Save & Restore Window Layout
 
 - Saves every window's exact position per screen combination
-- Identifies physical monitors by hardware fingerprint (vendor + model + serial) — never confuses screens
-- Instantly restores when monitors reconnect: office 3-screen, home 2-screen, cafe single-screen
+- Identifies physical monitors by hardware fingerprint (vendor + model + serial)
+- Restores the matching layout when displays reconnect
 - Portrait displays, mixed resolutions, any arrangement
 
 ### 2. Snap Bar — Drag to Layout
@@ -57,12 +51,12 @@ One-click prevent display sleep from the menu bar. Duration: 1h / 2h / 4h with c
 
 **Download (recommended)**
 
-Grab the DMG from [Releases](https://github.com/hgDendi/Zcreen/releases/latest) → drag to Applications → launch → grant Accessibility permission.
+Grab the DMG from [Releases](https://github.com/chdendi/Zcreen/releases/latest) → drag to Applications → launch → grant Accessibility permission.
 
 **Build from source**
 
 ```bash
-git clone https://github.com/hgDendi/Zcreen.git && cd Zcreen
+git clone https://github.com/chdendi/Zcreen.git && cd Zcreen
 make install
 ```
 

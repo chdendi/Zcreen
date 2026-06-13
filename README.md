@@ -1,38 +1,31 @@
 # Zcreen
 
 <p align="center">
-  <a href="https://github.com/hgDendi/Zcreen/releases/latest">
-    <img src="https://img.shields.io/github/v/release/hgDendi/Zcreen?style=flat-square&color=blue" alt="Latest Release">
+  <a href="https://github.com/chdendi/Zcreen/releases/latest">
+    <img src="https://img.shields.io/github/v/release/chdendi/Zcreen?style=flat-square&color=blue" alt="Latest Release">
   </a>
   <img src="https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
   <a href="README_EN.md">English</a>
 </p>
 
-**插上显示器，窗口自动回到上次的位置。** 不需要配置，不需要快捷键，不需要记住任何东西。
+**插上显示器，窗口自动回到上次的位置。** Zcreen 会按屏幕组合自动记忆和恢复窗口布局。
 
 <p align="center">
-  <a href="https://github.com/hgDendi/Zcreen/releases/latest">
-    <b>>>> 下载最新版 (DMG) <<<</b>
+  <a href="https://github.com/chdendi/Zcreen/releases/latest">
+    <b>下载最新版 DMG</b>
   </a>
 </p>
 
 ---
-
-## 解决什么问题
-
-每天在公司接上三块屏幕，所有窗口挤在笔记本上，花 5 分钟手动拖回去。
-回家接上家里的屏幕，又要重新摆一遍。
-
-**Zcreen 让你只摆一次。**
 
 ## 核心能力
 
 ### 1. 自动记忆 & 恢复窗口布局
 
 - 自动保存每种屏幕组合下所有窗口的精确位置
-- 通过硬件指纹（厂商 + 型号 + 序列号）识别物理显示器——不会认错屏幕
-- 插上显示器瞬间恢复，公司三屏、家里两屏、咖啡厅单屏无缝切换
+- 通过硬件指纹（厂商 + 型号 + 序列号）识别物理显示器
+- 插上显示器后自动恢复对应布局
 - 支持竖屏、不同分辨率、不同排列方式
 
 ### 2. Snap Bar — 拖拽即布局
@@ -58,12 +51,12 @@
 
 **直接下载（推荐）**
 
-从 [Releases](https://github.com/hgDendi/Zcreen/releases/latest) 下载 DMG → 拖到 Applications → 启动 → 授予辅助功能权限。
+从 [Releases](https://github.com/chdendi/Zcreen/releases/latest) 下载 DMG → 拖到 Applications → 启动 → 授予辅助功能权限。
 
 **源码构建**
 
 ```bash
-git clone https://github.com/hgDendi/Zcreen.git && cd Zcreen
+git clone https://github.com/chdendi/Zcreen.git && cd Zcreen
 make install
 ```
 

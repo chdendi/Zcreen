@@ -69,8 +69,16 @@ class LayoutSnapshotStore: ObservableObject {
     }
 
     func captureSnapshot(profileKey: String, profileLabel: String, windowManager: WindowManager,
-                         screens: [ScreenInfo], windowFilter: WindowFilter) -> LayoutSnapshot {
-        let allWindows = windowManager.getAllWindows(filter: windowFilter)
+                         screens: [ScreenInfo], excludeAppMatchers: [AppMatcher] = [],
+                         windowFilter: WindowFilter) -> LayoutSnapshot {
+        let allWindows = windowManager.getAllWindows(filter: windowFilter).filter {
+            !isExcluded(
+                bundleId: $0.bundleId,
+                appName: $0.appName,
+                excludeBundleIds: [],
+                excludeAppMatchers: excludeAppMatchers
+            )
+        }
         let windowSnapshots = allWindows.map { win -> WindowSnapshot in
             let screen = findScreen(for: win.frame, in: screens)
             return WindowSnapshot(
@@ -101,15 +109,19 @@ class LayoutSnapshotStore: ObservableObject {
     }
 
     func restoreSnapshot(_ snapshot: LayoutSnapshot, windowManager: WindowManager, excludeBundleIds: Set<String>,
-                         windowFilter: WindowFilter) {
+                         excludeAppMatchers: [AppMatcher] = [], windowFilter: WindowFilter) {
         restoreGeneration &+= 1
         let generation = restoreGeneration
         let missed = doRestore(snapshot: snapshot, windowManager: windowManager,
-                               excludeBundleIds: excludeBundleIds, windowFilter: windowFilter)
+                               excludeBundleIds: excludeBundleIds,
+                               excludeAppMatchers: excludeAppMatchers,
+                               windowFilter: windowFilter)
 
         if !missed.isEmpty {
             scheduleRetry(snapshot: snapshot, windowManager: windowManager,
-                          excludeBundleIds: excludeBundleIds, windowFilter: windowFilter,
+                          excludeBundleIds: excludeBundleIds,
+                          excludeAppMatchers: excludeAppMatchers,
+                          windowFilter: windowFilter,
                           missed: missed, attempt: 1, generation: generation)
         }
     }
@@ -117,7 +129,8 @@ class LayoutSnapshotStore: ObservableObject {
     // MARK: - Exponential backoff retry
 
     private func scheduleRetry(snapshot: LayoutSnapshot, windowManager: WindowManager,
-                               excludeBundleIds: Set<String>, windowFilter: WindowFilter,
+                               excludeBundleIds: Set<String>, excludeAppMatchers: [AppMatcher],
+                               windowFilter: WindowFilter,
                                missed: [String], attempt: Int, generation: UInt64) {
         let maxRetries = Constants.Timing.snapshotMaxRetries
         guard attempt <= maxRetries else {
@@ -142,10 +155,12 @@ class LayoutSnapshotStore: ObservableObject {
             }
             let stillMissed = self.doRestore(snapshot: snapshot, windowManager: windowManager,
                                              excludeBundleIds: excludeBundleIds,
+                                             excludeAppMatchers: excludeAppMatchers,
                                              windowFilter: windowFilter)
             if !stillMissed.isEmpty {
                 self.scheduleRetry(snapshot: snapshot, windowManager: windowManager,
                                    excludeBundleIds: excludeBundleIds,
+                                   excludeAppMatchers: excludeAppMatchers,
                                    windowFilter: windowFilter,
                                    missed: stillMissed, attempt: attempt + 1,
                                    generation: generation)
@@ -156,20 +171,31 @@ class LayoutSnapshotStore: ObservableObject {
     /// Returns bundle IDs of apps that were in snapshot but couldn't be found/moved.
     @discardableResult
     private func doRestore(snapshot: LayoutSnapshot, windowManager: WindowManager,
-                           excludeBundleIds: Set<String>, windowFilter: WindowFilter) -> [String] {
+                           excludeBundleIds: Set<String>, excludeAppMatchers: [AppMatcher],
+                           windowFilter: WindowFilter) -> [String] {
         let allWindows = windowManager.getAllWindows(filter: windowFilter)
         let currentScreens = currentScreensSnapshot()
         Log.snapshot.info("RESTORE: snapshot has \(snapshot.windows.count) saved, \(allWindows.count) running")
 
         var savedByBundle: [String: [WindowSnapshot]] = [:]
-        for w in snapshot.windows where !excludeBundleIds.contains(w.bundleId) && windowFilter.allows(snapshot: w) {
+        for w in snapshot.windows where !isExcluded(
+            bundleId: w.bundleId,
+            appName: w.appName,
+            excludeBundleIds: excludeBundleIds,
+            excludeAppMatchers: excludeAppMatchers
+        ) && windowFilter.allows(snapshot: w) {
             savedByBundle[w.bundleId, default: []].append(w)
         }
 
         var runningByBundle: [String: [WindowManager.WindowInfo]] = [:]
         for w in allWindows {
             let bid = w.bundleId ?? ""
-            if !excludeBundleIds.contains(bid) {
+            if !isExcluded(
+                bundleId: bid,
+                appName: w.appName,
+                excludeBundleIds: excludeBundleIds,
+                excludeAppMatchers: excludeAppMatchers
+            ) {
                 runningByBundle[bid, default: []].append(w)
             }
         }
@@ -223,6 +249,14 @@ class LayoutSnapshotStore: ObservableObject {
 
         Log.snapshot.info("RESTORE: moved \(restored) windows for '\(snapshot.profileLabel)'")
         return missed
+    }
+
+    private func isExcluded(bundleId: String?, appName: String?, excludeBundleIds: Set<String>,
+                            excludeAppMatchers: [AppMatcher]) -> Bool {
+        if let bundleId, excludeBundleIds.contains(bundleId) {
+            return true
+        }
+        return excludeAppMatchers.contains { $0.matches(bundleId: bundleId, appName: appName) }
     }
 
     // MARK: - Private

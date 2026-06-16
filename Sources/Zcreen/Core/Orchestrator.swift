@@ -328,6 +328,9 @@ final class Orchestrator: ObservableObject {
         )
         switch restoreResult {
         case .restored:
+            if let moveCount = ruleApplyService.applyRulesIfAvailable() {
+                Log.rule.info("Applied \(moveCount) rule moves after snapshot restore")
+            }
             lastAction = restoreResult.statusMessage
         case .missing:
             _ = ruleApplyService.applyFallbackRulesIfAvailable()

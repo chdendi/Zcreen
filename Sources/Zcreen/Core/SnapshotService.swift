@@ -59,12 +59,14 @@ final class SnapshotService {
     }
 
     func saveCurrentLayout(trigger: Trigger, force: Bool) -> SaveResult {
+        let configuration = configManager.configuration
         let captured = snapshotStore.captureSnapshot(
             profileKey: screenSession.currentProfileKey,
             profileLabel: screenSession.currentProfileLabel,
             windowManager: windowManager,
             screens: screenSession.currentScreens,
-            windowFilter: currentWindowFilter()
+            excludeAppMatchers: configuration.effectiveRules.map(\.app),
+            windowFilter: WindowFilter(configuration: configuration)
         )
 
         guard !captured.windows.isEmpty else {
@@ -135,11 +137,13 @@ final class SnapshotService {
             return .missing(profileLabel: profileLabel)
         }
 
+        let configuration = configManager.configuration
         snapshotStore.restoreSnapshot(
             snapshot,
             windowManager: windowManager,
             excludeBundleIds: [],
-            windowFilter: currentWindowFilter()
+            excludeAppMatchers: configuration.effectiveRules.map(\.app),
+            windowFilter: WindowFilter(configuration: configuration)
         )
         let message = successLogMessage(snapshot)
         Log.snapshot.info(message)

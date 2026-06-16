@@ -54,7 +54,7 @@ final class RuleApplyService {
     }
 
     @discardableResult
-    func applyFallbackRulesIfAvailable() -> Int? {
+    func applyRulesIfAvailable() -> Int? {
         let config = configManager.configuration
         guard !config.effectiveRules.isEmpty else {
             return nil
@@ -62,6 +62,11 @@ final class RuleApplyService {
 
         let matches = ruleEngine.matchRules(configuration: config, screenCount: screenSession.screenCount)
         return applyResolvedRules(matches, configuration: config)
+    }
+
+    @discardableResult
+    func applyFallbackRulesIfAvailable() -> Int? {
+        applyRulesIfAvailable()
     }
 
     func handleAppLaunch(bundleId: String?, appName: String?, completion: @escaping (AppLaunchResult?) -> Void) {

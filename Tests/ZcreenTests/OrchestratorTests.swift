@@ -149,6 +149,76 @@ final class OrchestratorTests: XCTestCase {
         XCTAssertEqual(snapshotStore.saveCallCount, 1)
     }
 
+    func testScreenChangeAppliesRulesAfterSnapshotRestore() {
+        let builtIn = makeScreen(
+            displayID: 1,
+            name: "Built-in Retina Display",
+            frame: CGRect(x: 0, y: 0, width: 1512, height: 982)
+        )
+        let portrait = makeScreen(
+            displayID: 2,
+            name: "Dell U2723QE",
+            frame: CGRect(x: -1080, y: 142, width: 1080, height: 1920)
+        )
+        let detector = ScreenDetector(shouldRegisterCallback: false)
+        detector.setStateForTesting(screens: [builtIn, portrait], profileKey: "dual", profileLabel: "Dual")
+
+        let configManager = ConfigManager(loadFromDisk: false, configDirectory: tempDirectory())
+        let config = Configuration(
+            version: 1,
+            debounceMs: 500,
+            screens: [ScreenAlias(alias: "portrait", nameContains: "U2723QE")],
+            rules: [Rule(app: AppMatcher(bundleId: "com.mitchellh.ghostty", nameContains: nil), targetScreen: "portrait", profileOverrides: nil)],
+            profiles: nil,
+            windowFilter: nil
+        )
+        configManager.setStateForTesting(configuration: config)
+
+        let snapshotStore = TestSnapshotStore()
+        snapshotStore.storedSnapshots["dual"] = LayoutSnapshot(
+            profileKey: "dual",
+            profileLabel: "Dual",
+            timestamp: Date(),
+            windows: [
+                WindowSnapshot(
+                    bundleId: "com.mitchellh.ghostty",
+                    appName: "Ghostty",
+                    windowTitle: "Claude",
+                    frame: .init(CGRect(x: 216, y: 33, width: 1080, height: 898)),
+                    screenName: "Built-in Retina Display",
+                    screenKey: builtIn.uniqueKey,
+                    relativeFrame: .init(x: 0.1, y: 0.1, width: 0.7, height: 0.8),
+                    windowRole: "AXWindow",
+                    windowSubrole: "AXStandardWindow"
+                )
+            ]
+        )
+
+        let windowManager = TestWindowManager()
+        windowManager.windowsByBundle["com.mitchellh.ghostty"] = [
+            makeWindowInfo(
+                bundleId: "com.mitchellh.ghostty",
+                title: "Claude",
+                frame: CGRect(x: 216, y: 33, width: 1080, height: 898),
+                appName: "Ghostty"
+            )
+        ]
+
+        let orchestrator = makeOrchestrator(
+            screenDetector: detector,
+            configManager: configManager,
+            windowManager: windowManager,
+            snapshotStore: snapshotStore
+        )
+
+        orchestrator.handleScreenChange(newProfileKey: "dual")
+
+        XCTAssertEqual(snapshotStore.restoreCallCount, 1)
+        XCTAssertEqual(snapshotStore.lastExcludeAppMatchers.first?.bundleId, "com.mitchellh.ghostty")
+        XCTAssertEqual(windowManager.moveToScreenCallCount, 1)
+        XCTAssertEqual(orchestrator.lastAction, "Restored layout for Dual")
+    }
+
     func testAppLaunchSchedulesDelayedAutoSaveAfterRuleMatch() {
         let screen = makeScreen(name: "Built-in Retina Display", frame: CGRect(x: 0, y: 0, width: 1512, height: 982))
         let detector = makeScreenDetector(screen: screen, profileKey: "main-profile", profileLabel: "Main")
@@ -649,6 +719,7 @@ private final class TestScheduler {
 private final class TestSnapshotStore: LayoutSnapshotStore {
     var nextCapturedSnapshot = LayoutSnapshot(profileKey: "", profileLabel: "", timestamp: Date(), windows: [])
     var storedSnapshots: [String: LayoutSnapshot] = [:]
+    private(set) var lastExcludeAppMatchers: [AppMatcher] = []
     private(set) var saveCallCount = 0
     private(set) var restoreCallCount = 0
 
@@ -666,12 +737,15 @@ private final class TestSnapshotStore: LayoutSnapshotStore {
     }
 
     override func captureSnapshot(profileKey: String, profileLabel: String, windowManager: WindowManager,
-                                  screens: [ScreenInfo], windowFilter: WindowFilter) -> LayoutSnapshot {
+                                  screens: [ScreenInfo], excludeAppMatchers: [AppMatcher],
+                                  windowFilter: WindowFilter) -> LayoutSnapshot {
         nextCapturedSnapshot
     }
 
     override func restoreSnapshot(_ snapshot: LayoutSnapshot, windowManager: WindowManager,
-                                  excludeBundleIds: Set<String>, windowFilter: WindowFilter) {
+                                  excludeBundleIds: Set<String>, excludeAppMatchers: [AppMatcher],
+                                  windowFilter: WindowFilter) {
+        lastExcludeAppMatchers = excludeAppMatchers
         restoreCallCount += 1
     }
 }

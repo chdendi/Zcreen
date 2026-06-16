@@ -59,6 +59,30 @@ final class SnapshotServiceTests: XCTestCase {
         XCTAssertTrue(fixture.store.storedSnapshots["main"]?.windows.contains(existingB) == true)
     }
 
+    func testSavePassesConfiguredRuleAppsAsCaptureExclusions() {
+        let fixture = makeFixture(
+            configuration: Configuration(
+                version: 1,
+                debounceMs: 500,
+                screens: nil,
+                rules: [
+                    Rule(
+                        app: AppMatcher(bundleId: "com.mitchellh.ghostty", nameContains: nil),
+                        targetScreen: "portrait",
+                        profileOverrides: nil
+                    )
+                ],
+                profiles: nil,
+                windowFilter: nil
+            )
+        )
+        fixture.store.nextCapturedSnapshot = makeSnapshot(windows: [makeWindow(bundleId: "com.test.a", title: "A", x: 10)])
+
+        _ = fixture.service.saveCurrentLayout(trigger: .periodic, force: false)
+
+        XCTAssertEqual(fixture.store.lastExcludeAppMatchers.first?.bundleId, "com.mitchellh.ghostty")
+    }
+
     // MARK: - Fixture
 
     private struct Fixture {
@@ -66,7 +90,7 @@ final class SnapshotServiceTests: XCTestCase {
         let store: StubSnapshotStore
     }
 
-    private func makeFixture() -> Fixture {
+    private func makeFixture(configuration: Configuration = .empty) -> Fixture {
         let detector = ScreenDetector(shouldRegisterCallback: false)
         detector.setStateForTesting(
             screens: [ScreenInfo(
@@ -83,12 +107,14 @@ final class SnapshotServiceTests: XCTestCase {
             profileLabel: "Main"
         )
         let store = StubSnapshotStore()
+        let configManager = ConfigManager(
+            loadFromDisk: false,
+            configDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        )
+        configManager.setStateForTesting(configuration: configuration)
         let service = SnapshotService(
             screenSession: ScreenSessionService(screenDetector: detector),
-            configManager: ConfigManager(
-                loadFromDisk: false,
-                configDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            ),
+            configManager: configManager,
             windowManager: WindowManager(),
             snapshotStore: store
         )
@@ -122,6 +148,7 @@ final class SnapshotServiceTests: XCTestCase {
 private final class StubSnapshotStore: LayoutSnapshotStore {
     var nextCapturedSnapshot = LayoutSnapshot(profileKey: "", profileLabel: "", timestamp: Date(), windows: [])
     var storedSnapshots: [String: LayoutSnapshot] = [:]
+    private(set) var lastExcludeAppMatchers: [AppMatcher] = []
     private(set) var saveCallCount = 0
 
     init() {
@@ -141,7 +168,9 @@ private final class StubSnapshotStore: LayoutSnapshotStore {
     }
 
     override func captureSnapshot(profileKey: String, profileLabel: String, windowManager: WindowManager,
-                                  screens: [ScreenInfo], windowFilter: WindowFilter) -> LayoutSnapshot {
-        nextCapturedSnapshot
+                                  screens: [ScreenInfo], excludeAppMatchers: [AppMatcher],
+                                  windowFilter: WindowFilter) -> LayoutSnapshot {
+        lastExcludeAppMatchers = excludeAppMatchers
+        return nextCapturedSnapshot
     }
 }

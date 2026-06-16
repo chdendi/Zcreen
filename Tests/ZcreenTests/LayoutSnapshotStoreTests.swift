@@ -106,6 +106,84 @@ final class LayoutSnapshotStoreTests: XCTestCase {
         XCTAssertEqual(snapshot.windows.first?.windowTitle, "Main")
     }
 
+    func testCaptureSnapshotSkipsRuleManagedWindows() {
+        let mainScreen = makeScreen(
+            displayID: 1,
+            name: "Built-in Retina Display",
+            frame: CGRect(x: 0, y: 0, width: 1512, height: 982)
+        )
+        let windows = [
+            makeWindowInfo(
+                bundleId: "com.mitchellh.ghostty",
+                appName: "Ghostty",
+                title: "Claude",
+                frame: CGRect(x: 216, y: 33, width: 1080, height: 898)
+            ),
+            makeWindowInfo(
+                bundleId: "com.google.Chrome",
+                appName: "Google Chrome",
+                title: "Browser",
+                frame: CGRect(x: 0, y: 33, width: 1512, height: 898)
+            ),
+        ]
+        let windowManager = SnapshotTestWindowManager(windows: windows)
+        let store = LayoutSnapshotStore(
+            snapshotDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString),
+            loadExisting: false
+        )
+
+        let snapshot = store.captureSnapshot(
+            profileKey: "single",
+            profileLabel: "Single",
+            windowManager: windowManager,
+            screens: [mainScreen],
+            excludeAppMatchers: [AppMatcher(bundleId: "com.mitchellh.ghostty", nameContains: nil)],
+            windowFilter: WindowFilter(configuration: .empty)
+        )
+
+        XCTAssertEqual(snapshot.windows.count, 1)
+        XCTAssertEqual(snapshot.windows.first?.bundleId, "com.google.Chrome")
+    }
+
+    func testRestoreSkipsSnapshotWindowsMatchingExcludedAppMatchers() {
+        let ghostty = makeWindowInfo(
+            bundleId: "com.mitchellh.ghostty",
+            appName: "Ghostty",
+            title: "Claude",
+            frame: CGRect(x: 216, y: 33, width: 1080, height: 898)
+        )
+        let chrome = makeWindowInfo(
+            bundleId: "com.google.Chrome",
+            appName: "Google Chrome",
+            title: "Browser",
+            frame: CGRect(x: 0, y: 33, width: 1512, height: 898)
+        )
+        let windowManager = RestoreCountingWindowManager(windows: [ghostty, chrome])
+        let store = LayoutSnapshotStore(
+            snapshotDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString),
+            loadExisting: false
+        )
+        let snapshot = LayoutSnapshot(
+            profileKey: "dual",
+            profileLabel: "Dual",
+            timestamp: Date(),
+            windows: [
+                makeWindowSnapshot(bundleId: "com.mitchellh.ghostty", appName: "Ghostty", title: "Claude"),
+                makeWindowSnapshot(bundleId: "com.google.Chrome", appName: "Google Chrome", title: "Browser"),
+            ]
+        )
+
+        store.restoreSnapshot(
+            snapshot,
+            windowManager: windowManager,
+            excludeBundleIds: [],
+            excludeAppMatchers: [AppMatcher(bundleId: "com.mitchellh.ghostty", nameContains: nil)],
+            windowFilter: WindowFilter(configuration: .empty)
+        )
+
+        XCTAssertEqual(windowManager.moveWindowCallCount, 1)
+    }
+
     private func makeScreen(displayID: CGDirectDisplayID, name: String, frame: CGRect) -> ScreenInfo {
         ScreenInfo(
             displayID: displayID,
@@ -135,6 +213,20 @@ final class LayoutSnapshotStoreTests: XCTestCase {
             axWindow: AXUIElementCreateSystemWide()
         )
     }
+
+    private func makeWindowSnapshot(bundleId: String, appName: String, title: String) -> WindowSnapshot {
+        WindowSnapshot(
+            bundleId: bundleId,
+            appName: appName,
+            windowTitle: title,
+            frame: .init(CGRect(x: 10, y: 20, width: 600, height: 400)),
+            screenName: "Built-in Retina Display",
+            screenKey: nil,
+            relativeFrame: nil,
+            windowRole: "AXWindow",
+            windowSubrole: "AXStandardWindow"
+        )
+    }
 }
 
 private final class SnapshotTestWindowManager: WindowManager {
@@ -152,5 +244,23 @@ private final class SnapshotTestWindowManager: WindowManager {
 
     override func getAllWindows() -> [WindowInfo] {
         windows
+    }
+}
+
+private final class RestoreCountingWindowManager: WindowManager {
+    private let windows: [WindowInfo]
+    private(set) var moveWindowCallCount = 0
+
+    init(windows: [WindowInfo]) {
+        self.windows = windows
+        super.init()
+    }
+
+    override func getAllWindows() -> [WindowInfo] {
+        windows
+    }
+
+    override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect) {
+        moveWindowCallCount += 1
     }
 }

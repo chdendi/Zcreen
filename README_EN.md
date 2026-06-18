@@ -74,6 +74,18 @@ make install
 | Permission lost after rebuild | Each build changes the code signature; re-add in Accessibility settings |
 | Snap Bar not showing | Verify Accessibility permission is granted and restart the app |
 
+## Reporting Issues
+
+When filing an issue, please include:
+
+- macOS version, Zcreen version, and your screen count / arrangement
+- Reproduction steps, for example: "drag Xcode to the left 1/2 Snap Bar zone"
+- Logs from the few minutes around the issue
+
+Open logs from the menu bar: Zcreen → **Logs**. Log files live in `~/Library/Logs/Zcreen/` and are named like `zcreen-YYYYMMDD.log`.
+
+Hidden debug entry: open the menu and click the Zcreen icon in the top-left 5 times to reveal the config directory at `~/.config/zcreen`. If the issue is related to rules or snapshots, include the relevant config or snapshot files too.
+
 ## License
 
 MIT

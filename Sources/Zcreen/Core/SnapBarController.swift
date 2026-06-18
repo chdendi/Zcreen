@@ -294,7 +294,7 @@ final class SnapBarController: ObservableObject {
             "Snap '\(preset.id)' on \(screen.localizedName) "
             + "target=(\(frame.origin.x), \(frame.origin.y), \(frame.width), \(frame.height))"
         )
-        windowManager.moveWindow(win, toFrame: frame)
+        windowManager.moveWindow(win, toFrame: frame, constrainedTo: accessibilityVisible)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + Constants.SnapBar.snapSaveDelay) { [weak self] in
             self?.onSnap?()

@@ -74,6 +74,18 @@ make install
 | 重新构建后权限失效 | 每次构建产生新签名，需重新添加 |
 | Snap Bar 不弹出 | 确认辅助功能权限已授予，重启应用 |
 
+## 反馈问题
+
+提交 issue 时，请尽量附上：
+
+- macOS 版本、Zcreen 版本、屏幕数量和排列方式
+- 复现步骤，例如“把 Xcode 拖到 Snap Bar 的左侧 1/2”
+- 复现前后几分钟的日志
+
+打开日志：点击菜单栏里的 Zcreen → 点击底部 **Logs**。日志文件位于 `~/Library/Logs/Zcreen/`，文件名形如 `zcreen-YYYYMMDD.log`。
+
+隐藏调试入口：打开菜单后，连续点击左上角 Zcreen 图标 5 次可以打开配置目录 `~/.config/zcreen`。如果问题和规则或快照有关，也可以把相关配置或 snapshot 一起附在 issue 里。
+
 ## License
 
 MIT

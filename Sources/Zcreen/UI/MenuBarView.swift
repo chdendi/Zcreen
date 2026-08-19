@@ -5,11 +5,10 @@ struct MenuBarView: View {
     @State private var launchAtLogin = LoginItemManager.isEnabled
     @State private var hoveredButton: String?
     @State private var accessibilityOK = AccessibilityHelper.isTrusted
-    @State private var showSavedApps = false
 
     var body: some View {
         VStack(spacing: 0) {
-            HeaderSection(orchestrator: orchestrator, showSavedApps: $showSavedApps)
+            HeaderSection(orchestrator: orchestrator)
 
             if orchestrator.autoUpdater.updateAvailable {
                 UpdateBanner(updater: orchestrator.autoUpdater)

@@ -2,6 +2,8 @@ import SwiftUI
 
 /// Shared UI helpers for MenuBar sections
 enum MenuBarHelpers {
+    static let caffeinateActiveColor = Color(red: 0.55, green: 0.36, blue: 0.96)
+
     static var sectionDivider: some View {
         Rectangle()
             .fill(Color.primary.opacity(0.06))

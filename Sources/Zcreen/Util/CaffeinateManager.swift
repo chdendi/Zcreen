@@ -3,8 +3,10 @@ import Combine
 
 final class CaffeinateManager: ObservableObject {
     @Published private(set) var isActive = false
+    @Published private(set) var isIndefinite = false
     @Published private(set) var remainingMinutes = 0
 
+    private let caffeinateExecutableURL: URL
     private var process: Process?
     private var countdownTimer: Timer?
 
@@ -14,30 +16,46 @@ final class CaffeinateManager: ObservableObject {
         ("4h", 240),
     ]
 
+    init(caffeinateExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/caffeinate")) {
+        self.caffeinateExecutableURL = caffeinateExecutableURL
+    }
+
     func activate(minutes: Int) {
+        start(arguments: ["-d", "-i", "-t", "\(minutes * 60)"], minutes: minutes, indefinite: false)
+    }
+
+    func activateIndefinitely() {
+        start(arguments: ["-d", "-i"], minutes: 0, indefinite: true)
+    }
+
+    private func start(arguments: [String], minutes: Int, indefinite: Bool) {
         deactivate()
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
-        proc.arguments = ["-d", "-i", "-t", "\(minutes * 60)"]
+        proc.executableURL = caffeinateExecutableURL
+        proc.arguments = arguments
 
         do {
             try proc.run()
             process = proc
             isActive = true
+            isIndefinite = indefinite
             remainingMinutes = minutes
 
-            let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
-                guard let self else { return }
-                self.remainingMinutes -= 1
-                if self.remainingMinutes <= 0 {
-                    self.deactivate()
+            if !indefinite {
+                let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+                    guard let self else { return }
+                    self.remainingMinutes -= 1
+                    if self.remainingMinutes <= 0 {
+                        self.deactivate()
+                    }
                 }
+                RunLoop.main.add(timer, forMode: .common)
+                countdownTimer = timer
             }
-            RunLoop.main.add(timer, forMode: .common)
-            countdownTimer = timer
 
-            Log.general.info("Caffeinate started for \(minutes) minutes")
+            let duration = indefinite ? "until stopped" : "for \(minutes) minutes"
+            Log.general.info("Caffeinate started \(duration)")
         } catch {
             Log.general.error("Failed to start caffeinate: \(error.localizedDescription)")
         }
@@ -49,6 +67,7 @@ final class CaffeinateManager: ObservableObject {
         countdownTimer?.invalidate()
         countdownTimer = nil
         isActive = false
+        isIndefinite = false
         remainingMinutes = 0
     }
 

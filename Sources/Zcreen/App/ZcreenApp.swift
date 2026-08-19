@@ -8,7 +8,7 @@ struct ZcreenApp: App {
         MenuBarExtra {
             MenuBarView(orchestrator: orchestrator)
         } label: {
-            Image(systemName: "rectangle.3.group")
+            MenuBarStatusIconView(caffeinateManager: orchestrator.caffeinateManager)
         }
         .menuBarExtraStyle(.window)
     }

@@ -68,6 +68,12 @@ class LayoutSnapshotStore: ObservableObject {
         }
     }
 
+    func snapshotFileURL(for profileKey: String) -> URL? {
+        guard cache[profileKey] != nil else { return nil }
+        let fileURL = snapshotDir.appendingPathComponent("\(fileNameHash(profileKey)).json")
+        return FileManager.default.fileExists(atPath: fileURL.path) ? fileURL : nil
+    }
+
     func captureSnapshot(profileKey: String, profileLabel: String, windowManager: WindowManager,
                          screens: [ScreenInfo], excludeAppMatchers: [AppMatcher] = [],
                          windowFilter: WindowFilter) -> LayoutSnapshot {

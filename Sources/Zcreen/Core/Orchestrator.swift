@@ -140,6 +140,7 @@ final class Orchestrator: ObservableObject {
             autoUpdater.objectWillChange.eraseToAnyPublisher(),
             configManager.objectWillChange.eraseToAnyPublisher(),
             resolvedSnapBarController.objectWillChange.eraseToAnyPublisher(),
+            caffeinateManager.objectWillChange.eraseToAnyPublisher(),
             resolvedMenuState.objectWillChange.eraseToAnyPublisher()
         )
 

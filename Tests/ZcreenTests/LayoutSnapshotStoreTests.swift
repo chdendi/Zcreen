@@ -4,6 +4,23 @@ import ApplicationServices
 
 final class LayoutSnapshotStoreTests: XCTestCase {
 
+    func testSnapshotFileURLReturnsSavedJSONForProfile() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store = LayoutSnapshotStore(snapshotDirectory: directory, loadExisting: false)
+        let snapshot = LayoutSnapshot(
+            profileKey: "desk-profile",
+            profileLabel: "Desk",
+            timestamp: Date(),
+            windows: []
+        )
+
+        store.save(snapshot: snapshot)
+
+        let fileURL = try XCTUnwrap(store.snapshotFileURL(for: "desk-profile"))
+        XCTAssertEqual(fileURL.pathExtension, "json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+    }
+
     func testCaptureSnapshotUsesAccessibilityScreenFrameForTallerExternalDisplay() throws {
         let mainScreen = makeScreen(
             displayID: 1,

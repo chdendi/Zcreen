@@ -29,17 +29,20 @@ final class RuleApplyService {
     private let configManager: ConfigManager
     private let windowManager: WindowManager
     private let ruleEngine: RuleEngine
+    private let snapshotStore: LayoutSnapshotStore
     private let scheduleAfter: (TimeInterval, @escaping () -> Void) -> Void
 
     init(screenSession: ScreenSessionService,
          configManager: ConfigManager,
          windowManager: WindowManager,
          ruleEngine: RuleEngine,
+         snapshotStore: LayoutSnapshotStore,
          scheduleAfter: @escaping (TimeInterval, @escaping () -> Void) -> Void) {
         self.screenSession = screenSession
         self.configManager = configManager
         self.windowManager = windowManager
         self.ruleEngine = ruleEngine
+        self.snapshotStore = snapshotStore
         self.scheduleAfter = scheduleAfter
     }
 
@@ -86,10 +89,10 @@ final class RuleApplyService {
             return
         }
 
-        guard let targetScreen = screenSession.screenDetector.screenInfo(
+        guard screenSession.screenDetector.screenInfo(
             forAlias: match.targetScreenAlias,
             configuration: config
-        ), let matchedBundleId = match.matchedBundleId else {
+        ) != nil, let matchedBundleId = match.matchedBundleId else {
             completion(nil)
             return
         }
@@ -101,24 +104,23 @@ final class RuleApplyService {
             action: { [weak self] windows in
                 guard let self else { return }
 
-                for win in windows {
-                    let center = CGPoint(x: win.frame.midX, y: win.frame.midY)
-                    if CoordinateConverter.containsAccessibilityPoint(
-                        center,
-                        in: targetScreen,
-                        screens: self.screenSession.currentScreens
-                    ) {
-                        continue
-                    }
-                    self.windowManager.moveWindowToScreen(
-                        win.axWindow,
-                        currentFrame: win.frame,
-                        targetScreen: targetScreen
-                    )
+                // Resolve the target again after polling: screens or rules may
+                // have changed while the app was creating its first window.
+                let currentConfig = self.configManager.configuration
+                guard let currentMatch = self.ruleEngine.matchRule(
+                    for: bundleId, appName: appName,
+                    configuration: currentConfig, screenCount: self.screenSession.screenCount
+                ), let currentTarget = self.screenSession.screenDetector.screenInfo(
+                    forAlias: currentMatch.targetScreenAlias, configuration: currentConfig
+                ) else {
+                    completion(nil)
+                    return
                 }
+                _ = self.applyWindows(windows.filter(WindowFilter(configuration: currentConfig).allows(window:)),
+                                      to: currentTarget, configuration: currentConfig)
 
-                Log.rule.info("Launch rule: \(appName ?? "unknown") -> \(match.targetScreenAlias)")
-                completion(AppLaunchResult(appName: appName ?? "app", targetScreenAlias: match.targetScreenAlias))
+                Log.rule.info("Launch rule: \(appName ?? "unknown") -> \(currentMatch.targetScreenAlias)")
+                completion(AppLaunchResult(appName: appName ?? "app", targetScreenAlias: currentMatch.targetScreenAlias))
             },
             onTimeout: {
                 completion(nil)
@@ -154,9 +156,12 @@ final class RuleApplyService {
 
     private func applyResolvedRules(_ matches: [RuleEngine.RuleMatch], configuration: Configuration) -> Int {
         let windows = windowManager.getAllWindows(filter: WindowFilter(configuration: configuration))
+        // Match all windows of an app together so each saved window is used once.
+        let windowsByBundle = Dictionary(grouping: windows, by: { $0.bundleId ?? "pid:\($0.pid)" })
         var applied = 0
 
-        for win in windows {
+        for appWindows in windowsByBundle.values {
+            guard let win = appWindows.first else { continue }
             guard let match = matches.first(where: {
                 $0.rule.app.matches(bundleId: win.bundleId, appName: win.appName)
             }) else {
@@ -170,11 +175,48 @@ final class RuleApplyService {
                 continue
             }
 
+            applied += applyWindows(appWindows, to: targetScreen, configuration: configuration)
+        }
+
+        return applied
+    }
+
+    private func applyWindows(_ windows: [WindowManager.WindowInfo], to targetScreen: ScreenInfo,
+                              configuration: Configuration) -> Int {
+        let screens = screenSession.currentScreens
+        let windowFilter = WindowFilter(configuration: configuration)
+        let savedWindows = snapshotStore.load(profileKey: screenSession.currentProfileKey)?.windows.filter {
+            $0.bundleId == windows.first?.bundleId && windowFilter.allows(snapshot: $0)
+                && $0.resolvedFrame(on: targetScreen, using: screens) != nil
+        } ?? []
+        let candidates = windows.map { win -> WindowMatchCandidate in
+            let screen = CoordinateConverter.screenContainingAccessibilityPoint(
+                CGPoint(x: win.frame.midX, y: win.frame.midY), in: screens
+            )
+            return WindowMatchCandidate(title: win.title, frame: win.frame,
+                                        screenName: screen?.name ?? "Unknown", screenKey: screen?.uniqueKey,
+                                        role: win.role, subrole: win.subrole)
+        }
+        let assignments = WindowMatcher.match(saved: savedWindows, running: candidates)
+        let savedByRunningIndex = Dictionary(uniqueKeysWithValues: assignments.map {
+            ($0.runningIndex, savedWindows[$0.savedIndex])
+        })
+
+        var applied = 0
+        for (index, win) in windows.enumerated() {
+            if let saved = savedByRunningIndex[index],
+               let target = saved.resolvedFrame(on: targetScreen, using: screens) {
+                windowManager.moveWindow(win.axWindow, toFrame: target)
+                Log.rule.info("Restored saved geometry for \(win.appName) on \(targetScreen.name) at \(target.debugDescription)")
+                applied += 1
+                continue
+            }
+
             let center = CGPoint(x: win.frame.midX, y: win.frame.midY)
             if CoordinateConverter.containsAccessibilityPoint(
                 center,
                 in: targetScreen,
-                screens: screenSession.currentScreens
+                screens: screens
             ) {
                 continue
             }

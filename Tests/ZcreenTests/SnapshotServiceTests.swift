@@ -59,7 +59,7 @@ final class SnapshotServiceTests: XCTestCase {
         XCTAssertTrue(fixture.store.storedSnapshots["main"]?.windows.contains(existingB) == true)
     }
 
-    func testSavePassesConfiguredRuleAppsAsCaptureExclusions() {
+    func testSaveIncludesConfiguredRuleAppsInCapture() {
         let fixture = makeFixture(
             configuration: Configuration(
                 version: 1,
@@ -76,11 +76,13 @@ final class SnapshotServiceTests: XCTestCase {
                 windowFilter: nil
             )
         )
-        fixture.store.nextCapturedSnapshot = makeSnapshot(windows: [makeWindow(bundleId: "com.test.a", title: "A", x: 10)])
+        let ghostty = makeWindow(bundleId: "com.mitchellh.ghostty", title: "Terminal", x: 10)
+        fixture.store.nextCapturedSnapshot = makeSnapshot(windows: [ghostty])
 
         _ = fixture.service.saveCurrentLayout(trigger: .periodic, force: false)
 
-        XCTAssertEqual(fixture.store.lastExcludeAppMatchers.first?.bundleId, "com.mitchellh.ghostty")
+        XCTAssertTrue(fixture.store.lastExcludeAppMatchers.isEmpty)
+        XCTAssertEqual(fixture.store.storedSnapshots["main"]?.windows, [ghostty])
     }
 
     // MARK: - Fixture

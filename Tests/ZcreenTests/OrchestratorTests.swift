@@ -187,7 +187,9 @@ final class OrchestratorTests: XCTestCase {
                     frame: .init(CGRect(x: 216, y: 33, width: 1080, height: 898)),
                     screenName: "Built-in Retina Display",
                     screenKey: builtIn.uniqueKey,
-                    relativeFrame: .init(x: 0.1, y: 0.1, width: 0.7, height: 0.8),
+                    relativeFrame: .relative(
+                        from: CGRect(x: 216, y: 33, width: 1080, height: 898), in: builtIn.frame
+                    ),
                     windowRole: "AXWindow",
                     windowSubrole: "AXStandardWindow"
                 )
@@ -215,7 +217,10 @@ final class OrchestratorTests: XCTestCase {
 
         XCTAssertEqual(snapshotStore.restoreCallCount, 1)
         XCTAssertEqual(snapshotStore.lastExcludeAppMatchers.first?.bundleId, "com.mitchellh.ghostty")
-        XCTAssertEqual(windowManager.moveToScreenCallCount, 1)
+        XCTAssertEqual(windowManager.moveToScreenCallCount, 0)
+        XCTAssertEqual(windowManager.movedFrames.count, 1)
+        XCTAssertEqual(windowManager.movedFrames.first?.width ?? 0, 1080, accuracy: 0.001)
+        XCTAssertEqual(windowManager.movedFrames.first?.height ?? 0, 898, accuracy: 0.001)
         XCTAssertEqual(orchestrator.lastAction, "Restored layout for Dual")
     }
 
@@ -753,6 +758,7 @@ private final class TestSnapshotStore: LayoutSnapshotStore {
 private final class TestWindowManager: WindowManager {
     var windowsByBundle: [String: [WindowInfo]] = [:]
     private(set) var moveToScreenCallCount = 0
+    private(set) var movedFrames: [CGRect] = []
 
     override func getAllWindows() -> [WindowInfo] {
         windowsByBundle.values.flatMap { $0 }
@@ -764,5 +770,9 @@ private final class TestWindowManager: WindowManager {
 
     override func moveWindowToScreen(_ window: AXUIElement, currentFrame: CGRect, targetScreen: ScreenInfo) {
         moveToScreenCallCount += 1
+    }
+
+    override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect) {
+        movedFrames.append(frame)
     }
 }

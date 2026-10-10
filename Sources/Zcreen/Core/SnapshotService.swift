@@ -65,7 +65,6 @@ final class SnapshotService {
             profileLabel: screenSession.currentProfileLabel,
             windowManager: windowManager,
             screens: screenSession.currentScreens,
-            excludeAppMatchers: configuration.effectiveRules.map(\.app),
             windowFilter: WindowFilter(configuration: configuration)
         )
 
@@ -138,11 +137,20 @@ final class SnapshotService {
         }
 
         let configuration = configManager.configuration
+        let profileName = configuration.profileName(for: screenSession.screenCount)
+        // Rules with a connected target restore their saved geometry through
+        // RuleApplyService. Other apps use the ordinary snapshot restore path.
+        let ruleApps = configuration.effectiveRules.filter { rule in
+            screenSession.screenDetector.screenInfo(
+                forAlias: rule.resolvedTargetScreen(for: profileName),
+                configuration: configuration
+            ) != nil
+        }.map(\.app)
         snapshotStore.restoreSnapshot(
             snapshot,
             windowManager: windowManager,
             excludeBundleIds: [],
-            excludeAppMatchers: configuration.effectiveRules.map(\.app),
+            excludeAppMatchers: ruleApps,
             windowFilter: WindowFilter(configuration: configuration)
         )
         let message = successLogMessage(snapshot)

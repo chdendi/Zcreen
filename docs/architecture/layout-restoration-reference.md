@@ -1,6 +1,6 @@
 # 布局恢复维护参考
 
-最后更新：2026-03-30
+最后更新：2026-10-10
 
 ## 目的
 
@@ -12,6 +12,7 @@
 - 显示器识别：`Sources/Zcreen/Core/ScreenDetector.swift`, `Sources/Zcreen/Model/ScreenInfo.swift`
 - 坐标换算：`Sources/Zcreen/Util/CoordinateConverter.swift`
 - 快照保存与恢复：`Sources/Zcreen/Core/LayoutSnapshotStore.swift`, `Sources/Zcreen/Core/SnapshotService.swift`
+- 应用选屏规则及历史尺寸恢复：`Sources/Zcreen/Core/RuleApplyService.swift`
 - 窗口匹配与过滤：`Sources/Zcreen/Core/WindowMatcher.swift`, `Sources/Zcreen/Core/WindowFilter.swift`
 
 ## 快照模型
@@ -45,6 +46,15 @@
 2. 对每组窗口用 `windowTitle`、`role`、`subrole`、`screenName`、窗口尺寸做打分匹配。
 3. 如果 `screenKey` 和 `relativeFrame` 能命中当前物理屏幕，则按相对坐标恢复。
 4. 如果当前环境无法解析目标物理屏幕，则退回保存时的绝对 `frame`。
+
+### 应用规则与历史布局
+
+- 配置了选屏规则的应用也参与快照保存，手动调整和 Snap Bar 吸附后的尺寸会更新历史记录。
+- 规则负责选择目标屏幕；`RuleApplyService` 从当前 `profileKey` 的快照中匹配该应用的窗口，优先恢复保存的几何信息。已在目标屏幕上的窗口也会恢复尺寸。
+- 目标屏幕与历史屏幕相同，继续使用物理屏幕 key 和相对坐标；规则改到另一块屏幕时，保留历史尺寸，并把窗口限制在目标屏幕范围内。
+- 没有当前屏幕组合的历史记录，或多出来的窗口无法配对时，沿用 `moveWindowToScreen` 的比例映射兜底。不使用其他屏幕组合的快照替代。
+- 应用启动、屏幕变化、手动恢复和手动应用规则共用这套策略。目标屏幕可用时，普通快照恢复会跳过对应规则应用，由规则服务恢复，避免窗口先回到历史屏幕后又被搬走。
+- 规则目标屏幕未连接时，普通快照恢复仍可恢复该应用，不会仅因存在规则就排除它。
 
 ## 显示器识别策略
 

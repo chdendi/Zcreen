@@ -123,7 +123,7 @@ final class LayoutSnapshotStoreTests: XCTestCase {
         XCTAssertEqual(snapshot.windows.first?.windowTitle, "Main")
     }
 
-    func testCaptureSnapshotSkipsRuleManagedWindows() {
+    func testCaptureSnapshotSkipsExplicitlyExcludedApps() {
         let mainScreen = makeScreen(
             displayID: 1,
             name: "Built-in Retina Display",

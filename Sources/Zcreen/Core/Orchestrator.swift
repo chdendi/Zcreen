@@ -122,6 +122,7 @@ final class Orchestrator: ObservableObject {
             configManager: configManager,
             windowManager: windowManager,
             ruleEngine: ruleEngine,
+            snapshotStore: snapshotStore,
             scheduleAfter: scheduleAfter
         )
 
@@ -180,6 +181,7 @@ final class Orchestrator: ObservableObject {
         guard ensureAccessibilityPermission(promptIfNeeded: true) else { return }
 
         lastAction = snapshotService.restoreCurrentLayout().statusMessage
+        _ = ruleApplyService.applyRulesIfAvailable()
     }
 
     // MARK: - Post-change restore

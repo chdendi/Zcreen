@@ -38,6 +38,43 @@ struct WindowSnapshot: Codable, Equatable {
         return relativeFrame.cgRect(in: screenFrame)
     }
 
+    /// A rule chooses the display; saved geometry supplies the window size.
+    /// On a different display, keep the saved size instead of scaling it by
+    /// the new display's aspect ratio, and fit the window within its bounds.
+    func resolvedFrame(on targetScreen: ScreenInfo, using screens: [ScreenInfo]) -> CGRect? {
+        guard let targetFrame = CoordinateConverter.accessibilityScreenFrame(for: targetScreen, screens: screens) else {
+            return nil
+        }
+
+        let savedFrame = resolvedFrame(using: screens)
+        guard [savedFrame.origin.x, savedFrame.origin.y, savedFrame.width, savedFrame.height,
+               targetFrame.origin.x, targetFrame.origin.y, targetFrame.width, targetFrame.height].allSatisfy({ $0.isFinite }),
+              savedFrame.width > 0, savedFrame.height > 0,
+              targetFrame.width > 0, targetFrame.height > 0 else {
+            return nil
+        }
+
+        let size = CGSize(width: min(savedFrame.width, targetFrame.width),
+                          height: min(savedFrame.height, targetFrame.height))
+        let origin: CGPoint
+        if screenKey == targetScreen.uniqueKey || targetFrame.contains(CGPoint(x: savedFrame.midX, y: savedFrame.midY)) {
+            origin = savedFrame.origin
+        } else if let relativeFrame, relativeFrame.x.isFinite, relativeFrame.y.isFinite {
+            origin = CGPoint(x: targetFrame.minX + CGFloat(relativeFrame.x) * targetFrame.width,
+                             y: targetFrame.minY + CGFloat(relativeFrame.y) * targetFrame.height)
+        } else {
+            origin = CGPoint(x: targetFrame.midX - size.width / 2,
+                             y: targetFrame.midY - size.height / 2)
+        }
+
+        return CGRect(
+            x: min(max(origin.x, targetFrame.minX), targetFrame.maxX - size.width),
+            y: min(max(origin.y, targetFrame.minY), targetFrame.maxY - size.height),
+            width: size.width,
+            height: size.height
+        )
+    }
+
     struct CodableRect: Codable, Equatable {
         let x: Double
         let y: Double

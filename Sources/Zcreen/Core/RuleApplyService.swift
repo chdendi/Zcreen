@@ -31,6 +31,9 @@ final class RuleApplyService {
     private let ruleEngine: RuleEngine
     private let snapshotStore: LayoutSnapshotStore
     private let scheduleAfter: (TimeInterval, @escaping () -> Void) -> Void
+    private var launchGeneration: UInt64 = 0
+
+    func cancelPendingLaunches() { launchGeneration &+= 1 }
 
     init(screenSession: ScreenSessionService,
          configManager: ConfigManager,
@@ -97,25 +100,22 @@ final class RuleApplyService {
             return
         }
 
-        let windowFilter = WindowFilter(configuration: config)
+        let generation = launchGeneration
         waitForWindows(
             bundleId: matchedBundleId,
-            windowFilter: windowFilter,
+            generation: generation,
             action: { [weak self] windows in
                 guard let self else { return }
-
-                // Resolve the target again after polling: screens or rules may
-                // have changed while the app was creating its first window.
+                guard generation == self.launchGeneration else { completion(nil); return }
                 let currentConfig = self.configManager.configuration
-                guard let currentMatch = self.ruleEngine.matchRule(
-                    for: bundleId, appName: appName,
-                    configuration: currentConfig, screenCount: self.screenSession.screenCount
-                ), let currentTarget = self.screenSession.screenDetector.screenInfo(
-                    forAlias: currentMatch.targetScreenAlias, configuration: currentConfig
-                ) else {
+                guard let currentMatch = self.ruleEngine.matchRule(for: matchedBundleId, appName: appName,
+                    configuration: currentConfig, screenCount: self.screenSession.screenCount),
+                      let currentTarget = self.screenSession.screenDetector.screenInfo(
+                        forAlias: currentMatch.targetScreenAlias, configuration: currentConfig) else {
                     completion(nil)
                     return
                 }
+
                 _ = self.applyWindows(windows.filter(WindowFilter(configuration: currentConfig).allows(window:)),
                                       to: currentTarget, configuration: currentConfig)
 
@@ -129,18 +129,20 @@ final class RuleApplyService {
     }
 
     private func waitForWindows(bundleId: String,
-                                windowFilter: WindowFilter,
+                                generation: UInt64,
                                 attempt: Int = 1,
                                 action: @escaping ([WindowManager.WindowInfo]) -> Void,
                                 onTimeout: (() -> Void)? = nil) {
-        let windows = windowManager.getWindows(bundleId: bundleId, filter: windowFilter)
+        guard generation == launchGeneration else { onTimeout?(); return }
+        let windows = windowManager.getWindows(bundleId: bundleId,
+            filter: WindowFilter(configuration: configManager.configuration))
         if !windows.isEmpty {
             action(windows)
         } else if attempt < Constants.Timing.appLaunchPollMaxAttempts {
             scheduleAfter(Constants.Timing.appLaunchPollInterval) { [weak self] in
                 self?.waitForWindows(
                     bundleId: bundleId,
-                    windowFilter: windowFilter,
+                    generation: generation,
                     attempt: attempt + 1,
                     action: action,
                     onTimeout: onTimeout

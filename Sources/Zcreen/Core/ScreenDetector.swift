@@ -7,7 +7,7 @@ final class ScreenDetector: ObservableObject {
     @Published private(set) var profileKey: String = ""
     @Published private(set) var profileLabel: String = ""
 
-    private let screenChangeSubject = PassthroughSubject<Void, Never>()
+    private let screenChangeSubject = PassthroughSubject<Bool, Never>()
     private let beginConfigSubject = PassthroughSubject<Void, Never>()
     private var cancellables = Set<AnyCancellable>()
     private var callbackRegistered = false
@@ -15,14 +15,12 @@ final class ScreenDetector: ObservableObject {
     var screenCount: Int { screens.count }
 
     /// Fires after screen changes settle. Emits the new profileKey.
-    /// Uses throttle (latest, ~`Constants.Timing.screenChangeDebounceMs`) instead of a
-    /// fixed debounce so a burst of reconfig events collapses into a single trailing
-    /// notification very quickly after settle. `.beginConfigurationFlag` pulses are
-    /// dropped at the source (never pushed onto `screenChangeSubject`).
+    /// Wait for a quiet interval, including begin pulses, before refreshing topology.
     var onScreensChanged: AnyPublisher<String, Never> {
         screenChangeSubject
-            .throttle(for: .milliseconds(Constants.Timing.screenChangeDebounceMs), scheduler: DispatchQueue.main, latest: true)
-            .map { [weak self] in
+            .debounce(for: .milliseconds(Constants.Timing.screenChangeDebounceMs), scheduler: DispatchQueue.main)
+            .filter { $0 }
+            .map { [weak self] _ in
                 self?.refreshScreens()
                 return self?.profileKey ?? ""
             }
@@ -121,8 +119,7 @@ final class ScreenDetector: ObservableObject {
         )
     }
 
-    /// Profile key = sorted hardware unique keys joined with "+".
-    /// e.g. "1552-0-0+4268-16643-12345+4268-16644-67890"
+    /// Profile key = sorted persistent display UUIDs joined with "+".
     private func generateProfileKey(from screens: [ScreenInfo]) -> String {
         screens.map { $0.uniqueKey }.sorted().joined(separator: "+")
     }
@@ -138,20 +135,18 @@ final class ScreenDetector: ObservableObject {
         callbackRegistered = true
     }
 
-    fileprivate func handleDisplayChange(flags: CGDisplayChangeSummaryFlags) {
+    func handleDisplayChange(flags: CGDisplayChangeSummaryFlags) {
         if flags.contains(.beginConfigurationFlag) {
-            // Begin pulses early-return so they never reach screenChangeSubject; wait for
-            // a concrete add/remove/move/setMain to publish a settled change.
+            // Begin pulses reset the quiet interval without publishing a completion.
             beginConfigSubject.send()
+            screenChangeSubject.send(false)
             return
         }
 
-        let isConcreteChange = flags.contains(.addFlag) || flags.contains(.removeFlag) ||
-            flags.contains(.movedFlag) || flags.contains(.setMainFlag)
-
-        if isConcreteChange {
-            screenChangeSubject.send()
-        }
+        // CoreGraphics invokes a post-configuration callback for every online
+        // display. An unchanged display may have no flags; it still ends the
+        // transaction. Mode, mirroring and desktop-shape changes also settle here.
+        screenChangeSubject.send(true)
     }
 
     func setStateForTesting(screens: [ScreenInfo], profileKey: String? = nil, profileLabel: String? = nil) {

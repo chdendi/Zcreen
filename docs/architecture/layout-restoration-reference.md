@@ -1,6 +1,6 @@
 # 布局恢复维护参考
 
-最后更新：2026-10-10
+最后更新：2026-10-11
 
 ## 目的
 
@@ -43,7 +43,7 @@
 恢复时并不是无条件回放绝对坐标，而是按下面的顺序处理：
 
 1. 用 `bundleId` 对快照窗口和运行中窗口分组。
-2. 对每组窗口用 `windowTitle`、`role`、`subrole`、`screenName`、窗口尺寸做打分匹配。
+2. 对每组窗口用 `windowTitle`、`role`、`subrole`、`screenKey`、`screenName`、窗口尺寸做打分匹配。跳过非正分数配对；多窗口候选还会跳过低置信度配对。
 3. 如果 `screenKey` 和 `relativeFrame` 能命中当前物理屏幕，则按相对坐标恢复。
 4. 如果当前环境无法解析目标物理屏幕，则退回保存时的绝对 `frame`。
 
@@ -60,7 +60,9 @@
 
 ### 物理屏幕唯一键
 
-`ScreenInfo.uniqueKey` 的格式是 `vendorID-modelID-serialNumber`。Zcreen 当前把它视为“同一块物理屏幕”的稳定标识。
+`ScreenInfo.uniqueKey` 优先使用 `CGDisplayCreateUUIDFromDisplayID` 返回的 UUID；不可用时回退到 `vendorID-modelID-serialNumber`，再回退到 `display-<id>`。它能减少同型号、零序列号显示器被旧硬件组合键合并的问题。
+
+加载当前 profile 时，如果只有旧硬件组合键快照，且每块显示器可唯一映射，会迁移 profile 与窗口的 `screenKey`，保留原文件。旧键存在歧义时不猜测映射。
 
 ### Profile 生成
 
@@ -89,7 +91,16 @@
 `ScreenDetector` 同时监听两类时机：
 
 - `beginConfigurationFlag`：显示器重配即将开始，用于在系统重新排窗前保存快照。
-- `add/remove/moved/setMain`：显示器变化完成后，经 debounce 再刷新当前 profile。
+- 所有非 begin 的重配回调（包括分辨率、镜像和无逐屏变化标志的完成回调）：静默 500 ms 后刷新当前 profile。新的 begin 会重置静默计时。
+
+重配开始后阻止周期、手动和事件后的延迟保存，稳定后延迟 5 秒再开放保存。重复 begin 不重复捕获；新的重配和锁屏会使旧的保存任务、恢复重试和应用启动规则轮询失效。唤醒阶段另有自适应等待与冷却窗口。
+
+## 保存与重试
+
+- 快照先原子写盘，成功后才更新缓存和 profile 计数；失败传回调用方。
+- AX 漏报整个应用时保留该应用的旧位置；明确排除的应用会从合并快照中移除。选屏规则管理的窗口仍保留历史尺寸供规则恢复。
+- 恢复重试只处理仍在运行且尚未匹配的窗口，排除已经请求移动的 AX 窗口。最大重试三次，延迟为 0.4 / 0.8 / 1.6 秒。
+- 切换到没有快照的 profile 也会取消旧恢复，避免旧布局在新组合中继续执行。
 
 ## 坐标与恢复策略
 
@@ -111,6 +122,5 @@
 
 ## 维护建议
 
-- 修改快照字段时，同时更新 `tap-agents/prompts/modules/Model.md`。
-- 修改 profile 生成或屏幕识别逻辑时，同时更新 `tap-agents/prompts/modules/Core.md` 和 `tap-agents/prompts/module-map.md`。
+- 修改快照字段、profile 生成或屏幕识别逻辑时，同时更新本文件与对应回归测试。
 - 如果新增了恢复兜底规则或明确发现新的失败边界，优先把限制写回本文件。

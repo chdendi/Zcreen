@@ -33,8 +33,8 @@ struct WindowMatchAssignment {
 enum WindowMatcher {
     static func match(saved: [WindowSnapshot], running: [WindowMatchCandidate]) -> [WindowMatchAssignment] {
         // Compute every (saved, running) pair once, then greedily pick best-score pairs while
-        // skipping already-claimed indices. Behaviorally equivalent to repeatedly scanning for the
-        // current max but O(N² log N) instead of O(N³).
+        // skipping already-claimed indices and ambiguous weak matches.
+        // O(N² log N) instead of repeatedly scanning for the maximum in O(N³).
         var pairs: [WindowMatchAssignment] = []
         pairs.reserveCapacity(saved.count * running.count)
         for savedIndex in saved.indices {
@@ -53,6 +53,10 @@ enum WindowMatcher {
 
         for pair in pairs {
             if assignments.count == limit { break }
+            // Weak unnamed-window matches remain useful, but contradictory evidence
+            // must not force a new document into an unrelated saved window's slot.
+            if pair.score <= 0 { break }
+            if pair.isLowConfidence && (saved.count > 1 || running.count > 1) { continue }
             if usedSaved.contains(pair.savedIndex) || usedRunning.contains(pair.runningIndex) { continue }
             assignments.append(pair)
             usedSaved.insert(pair.savedIndex)

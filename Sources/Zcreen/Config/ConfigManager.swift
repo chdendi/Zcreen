@@ -143,8 +143,7 @@ final class ConfigManager: ObservableObject {
             if let issue = validate(decoded) {
                 configIssue = issue
                 Log.config.error("Config validation failed: \(issue.message)")
-                // Still use the decoded config for fields that are valid
-                configuration = decoded
+                // Keep the last known-good configuration while the user edits the file.
                 return
             }
 
@@ -155,7 +154,6 @@ final class ConfigManager: ObservableObject {
             let issue = decodingIssue(for: error)
             configIssue = issue
             Log.config.error("Failed to parse config: \(issue.message)")
-            configuration = Configuration.empty
         } catch {
             configIssue = ConfigIssue(
                 summary: "Cannot read config file",
@@ -163,7 +161,6 @@ final class ConfigManager: ObservableObject {
                 suggestion: "Check that config.json exists and that Zcreen can read it."
             )
             Log.config.error("Failed to load config: \(error.localizedDescription)")
-            configuration = Configuration.empty
         }
     }
 
@@ -180,6 +177,11 @@ final class ConfigManager: ObservableObject {
 
         // Check screen alias uniqueness
         if let screens = config.screens {
+            if screens.contains(where: { $0.alias.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                $0.nameContains.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+                return ConfigIssue(summary: "Screen alias and name matcher cannot be blank", fieldPath: "screens",
+                                   suggestion: "Use a non-empty alias and display name matcher.")
+            }
             let aliases = screens.map(\.alias)
             let unique = Set(aliases)
             if aliases.count != unique.count {
@@ -227,7 +229,7 @@ final class ConfigManager: ObservableObject {
         // Check rules have at least bundleId or nameContains
         if let rules = config.rules {
             for (i, rule) in rules.enumerated() {
-                if rule.app.bundleId == nil && rule.app.nameContains == nil {
+                if !rule.app.isValid {
                     return ConfigIssue(
                         summary: "Rule matcher is missing both bundleId and nameContains",
                         fieldPath: "rules[\(i)].app",
@@ -254,7 +256,7 @@ final class ConfigManager: ObservableObject {
             }
             if let excludedApps = filter.excludedApps {
                 for (i, matcher) in excludedApps.enumerated() {
-                    if matcher.bundleId == nil && matcher.nameContains == nil {
+                    if !matcher.isValid {
                         return ConfigIssue(
                             summary: "windowFilter exclusion matcher is incomplete",
                             fieldPath: "windowFilter.excludedApps[\(i)]",

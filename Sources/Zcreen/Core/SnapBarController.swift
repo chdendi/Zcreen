@@ -2,12 +2,31 @@ import Cocoa
 import ApplicationServices
 
 final class SnapBarController: ObservableObject {
-    @Published var isEnabled = true
+    @Published var isEnabled = true {
+        didSet {
+            guard oldValue != isEnabled else { return }
+            if isEnabled {
+                if pollingAllowed { startPolling(highFrequency: false) }
+            } else {
+                pollTimer?.invalidate()
+                pollTimer = nil
+                isHighFrequency = false
+                hidePanel()
+                dragState = .idle
+                targetWindow = nil
+                initialMousePos = nil
+                clickedTitleBar = false
+                wasMouseDown = false
+                tickCount = 0
+            }
+        }
+    }
 
     /// Called after a preset is applied, so the layout can be saved
     var onSnap: (() -> Void)?
 
     private let windowManager: WindowManager
+    private let pollingAllowed: Bool
     private var panel: SnapBarPanel?
     private var isShowing = false
     private var targetWindow: AXUIElement?
@@ -25,6 +44,7 @@ final class SnapBarController: ObservableObject {
 
     init(windowManager: WindowManager, shouldStartPolling: Bool = true) {
         self.windowManager = windowManager
+        self.pollingAllowed = shouldStartPolling
         if shouldStartPolling {
             startPolling(highFrequency: false)
         }

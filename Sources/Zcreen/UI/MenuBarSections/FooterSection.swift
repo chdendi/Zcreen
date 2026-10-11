@@ -9,6 +9,15 @@ struct FooterSection: View {
         VStack(spacing: 0) {
             MenuBarHelpers.sectionDivider
 
+            if let error = updater.errorMessage {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+            }
+
             HStack(spacing: 0) {
                 footerButton("About") { showAbout() }
 
@@ -66,7 +75,8 @@ struct FooterSection: View {
     private func showAbout() {
         let alert = NSAlert()
         alert.messageText = "Zcreen"
-        alert.informativeText = "Version 1.2.0\n\nMulti-screen window manager for macOS.\nAutomatically saves and restores window layouts when screens change.\n\nNo configuration needed \u{2014} just plug/unplug your displays."
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+        alert.informativeText = "Version \(version)\n\nMulti-screen window manager for macOS.\nAutomatically saves and restores window layouts when screens change.\n\nNo configuration needed \u{2014} just plug/unplug your displays."
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()

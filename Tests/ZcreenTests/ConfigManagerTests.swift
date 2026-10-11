@@ -3,6 +3,38 @@ import XCTest
 
 final class ConfigManagerTests: XCTestCase {
 
+    func testInvalidReloadKeepsLastValidConfiguration() throws {
+        let directory = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try writeConfig("""
+        {"version":1,"screens":[{"alias":"main","nameContains":"Display"}],
+         "rules":[{"app":{"bundleId":"com.test.app"},"targetScreen":"main"}]}
+        """, to: directory)
+        let manager = ConfigManager(configDirectory: directory)
+        try writeConfig("{ invalid json }", to: directory)
+        manager.reload()
+        XCTAssertNotNil(manager.configIssue)
+        XCTAssertEqual(manager.configuration.effectiveRules.first?.app.bundleId, "com.test.app")
+        try writeConfig("""
+        {"version":2,"rules":[{"app":{"bundleId":"com.other.app"},"targetScreen":"missing"}]}
+        """, to: directory)
+        manager.reload()
+        XCTAssertEqual(manager.configuration.version, 1)
+        XCTAssertEqual(manager.configuration.effectiveRules.first?.app.bundleId, "com.test.app")
+    }
+
+    func testBlankNameMatcherIsRejected() throws {
+        let directory = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try writeConfig("""
+        {"version":1,"screens":[{"alias":"main","nameContains":"Display"}],
+         "rules":[{"app":{"nameContains":"   "},"targetScreen":"main"}]}
+        """, to: directory)
+        let manager = ConfigManager(configDirectory: directory)
+        XCTAssertNotNil(manager.configIssue)
+        XCTAssertTrue(manager.configuration.effectiveRules.isEmpty)
+    }
+
     func testConfigIssueIncludesFieldPathForMissingVersion() throws {
         let configDirectory = tempDirectory()
         try writeConfig(

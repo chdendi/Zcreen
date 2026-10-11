@@ -3,6 +3,51 @@ import XCTest
 
 final class SnapshotServiceTests: XCTestCase {
 
+    func testSaveFailureIsReportedInsteadOfClaimingSuccess() {
+        let fixture = makeFixture()
+        fixture.store.shouldSave = false
+        fixture.store.nextCapturedSnapshot = makeSnapshot(windows: [makeWindow(bundleId: "a", title: "A", x: 10)])
+        guard case .failed = fixture.service.saveCurrentLayout(trigger: .manual, force: true) else {
+            return XCTFail("Expected a failed save result")
+        }
+        XCTAssertNil(fixture.store.storedSnapshots["main"])
+    }
+
+    func testEmptyCaptureRemovesExplicitExclusionsAndKeepsMissingAllowedApps() {
+        let fixture = makeFixture(configuration: configurationExcludingAppB())
+        let allowed = makeWindow(bundleId: "com.test.a", title: "A", x: 10)
+        let managed = makeWindow(bundleId: "com.test.b", title: "B", x: 500)
+        fixture.store.storedSnapshots["main"] = makeSnapshot(windows: [allowed, managed])
+        fixture.store.nextCapturedSnapshot = makeSnapshot(windows: [])
+        guard case .saved(let count) = fixture.service.saveCurrentLayout(trigger: .periodic, force: false) else {
+            return XCTFail("Explicit exclusions should be removed from the stored layout")
+        }
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(fixture.store.storedSnapshots["main"]?.windows, [allowed])
+    }
+
+    func testMergeRemovesPreviouslySavedExplicitlyExcludedApps() {
+        let fixture = makeFixture(configuration: configurationExcludingAppB())
+        let windowA = makeWindow(bundleId: "com.test.a", title: "A", x: 10)
+        let windowB = makeWindow(bundleId: "com.test.b", title: "B", x: 500)
+        fixture.store.storedSnapshots["main"] = makeSnapshot(windows: [windowA, windowB])
+        fixture.store.nextCapturedSnapshot = makeSnapshot(windows: [windowA])
+        _ = fixture.service.saveCurrentLayout(trigger: .periodic, force: false)
+        XCTAssertEqual(fixture.store.storedSnapshots["main"]?.windows, [windowA])
+    }
+
+    func testMissingRuleManagedAppKeepsItsSavedGeometry() {
+        let fixture = makeFixture(configuration: Configuration(version: 1, debounceMs: nil, screens: nil,
+            rules: [Rule(app: AppMatcher(bundleId: "com.test.b", nameContains: nil),
+                         targetScreen: "main", profileOverrides: nil)], profiles: nil, windowFilter: nil))
+        let windowA = makeWindow(bundleId: "com.test.a", title: "A", x: 10)
+        let windowB = makeWindow(bundleId: "com.test.b", title: "B", x: 500)
+        fixture.store.storedSnapshots["main"] = makeSnapshot(windows: [windowB])
+        fixture.store.nextCapturedSnapshot = makeSnapshot(windows: [windowA])
+        _ = fixture.service.saveCurrentLayout(trigger: .periodic, force: false)
+        XCTAssertEqual(fixture.store.storedSnapshots["main"]?.windows, [windowA, windowB])
+    }
+
     func testSavePreservesEntriesForAppsMissingFromCapture() {
         // AX returned nothing for app B in this capture (busy / mid-launch).
         // Its saved windows must survive the save instead of being dropped.
@@ -87,6 +132,12 @@ final class SnapshotServiceTests: XCTestCase {
 
     // MARK: - Fixture
 
+    private func configurationExcludingAppB() -> Configuration {
+        Configuration(version: 1, debounceMs: nil, screens: nil, rules: nil, profiles: nil,
+            windowFilter: WindowFilterConfig(excludedApps: [AppMatcher(bundleId: "com.test.b", nameContains: nil)],
+                excludedRoles: nil, excludedSubroles: nil, minWidth: nil, minHeight: nil, excludeMinimized: nil))
+    }
+
     private struct Fixture {
         let service: SnapshotService
         let store: StubSnapshotStore
@@ -148,6 +199,7 @@ final class SnapshotServiceTests: XCTestCase {
 }
 
 private final class StubSnapshotStore: LayoutSnapshotStore {
+    var shouldSave = true
     var nextCapturedSnapshot = LayoutSnapshot(profileKey: "", profileLabel: "", timestamp: Date(), windows: [])
     var storedSnapshots: [String: LayoutSnapshot] = [:]
     private(set) var lastExcludeAppMatchers: [AppMatcher] = []
@@ -160,9 +212,11 @@ private final class StubSnapshotStore: LayoutSnapshotStore {
         )
     }
 
-    override func save(snapshot: LayoutSnapshot) {
+    override func save(snapshot: LayoutSnapshot) -> Bool {
         saveCallCount += 1
+        guard shouldSave else { return false }
         storedSnapshots[snapshot.profileKey] = snapshot
+        return true
     }
 
     override func load(profileKey: String) -> LayoutSnapshot? {

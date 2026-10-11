@@ -74,6 +74,9 @@ jobs:
 
           exit "${missing}"
 
+      - name: Run regression tests
+        run: swift test
+
       - name: Import Developer ID certificate
         shell: bash
         env:

@@ -3,6 +3,22 @@ import XCTest
 
 final class WindowMatcherTests: XCTestCase {
 
+    func testWeakMatchIsSkippedWhenOnlyOneOfSeveralSavedWindowsAppears() {
+        let saved = [
+            makeSnapshot(title: nil, width: 800, height: 600, role: nil, subrole: nil),
+            makeSnapshot(title: nil, width: 800, height: 600, role: nil, subrole: nil),
+        ]
+        let running = [makeCandidate(title: nil, width: 800, height: 600, role: nil, subrole: nil)]
+        XCTAssertTrue(WindowMatcher.match(saved: saved, running: running).isEmpty)
+    }
+
+    func testDoesNotAssignUnrelatedWindowsWithNegativeScores() {
+        let saved = [makeSnapshot(title: "Old project", width: 1200, height: 900, screenKey: "old-screen")]
+        let running = [makeCandidate(title: "New document", width: 600, height: 400,
+                                     screenName: "Other", screenKey: "other-screen")]
+        XCTAssertTrue(WindowMatcher.match(saved: saved, running: running).isEmpty)
+    }
+
     func testMatchesWindowsByExactTitleEvenWhenOrderDiffers() {
         let saved = [
             makeSnapshot(title: "Inbox", width: 900, height: 700),

@@ -4,6 +4,75 @@ import ApplicationServices
 
 final class LayoutSnapshotStoreTests: XCTestCase {
 
+    func testRestoreAlsoChecksCurrentAppNameAgainstExclusions() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let current = makeWindowInfo(bundleId: "com.test.app", appName: "Excluded Edition",
+                                     title: "Editor", frame: CGRect(x: 100, y: 100, width: 600, height: 400))
+        let manager = RestoreCountingWindowManager(windows: [current])
+        let store = LayoutSnapshotStore(snapshotDirectory: directory, loadExisting: false, runningBundleIds: { [] })
+        let snapshot = LayoutSnapshot(profileKey: "main", profileLabel: "Main", timestamp: Date(),
+            windows: [makeWindowSnapshot(bundleId: "com.test.app", appName: "Previous Name", title: "Editor")])
+        store.restoreSnapshot(snapshot, windowManager: manager, excludeBundleIds: [],
+            excludeAppMatchers: [AppMatcher(bundleId: nil, nameContains: "Excluded")],
+            windowFilter: WindowFilter(configuration: .empty))
+        XCTAssertEqual(manager.moveWindowCallCount, 0)
+    }
+
+    func testLegacySnapshotMigratesToCurrentDisplayUUIDAndSurvivesReload() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let detector = ScreenDetector(shouldRegisterCallback: false)
+        detector.setStateForTesting(screens: [legacyScreen(id: 1, uuid: "uuid-main", serial: 1001)])
+        let oldKey = "1-101-1001"
+        let oldWindow = WindowSnapshot(bundleId: "com.test.app", appName: "Test", windowTitle: "Editor",
+            frame: .init(CGRect(x: 100, y: 50, width: 600, height: 400)), screenName: "Main",
+            screenKey: oldKey, relativeFrame: .init(x: 0.1, y: 0.1, width: 0.5, height: 0.5),
+            windowRole: "AXWindow", windowSubrole: "AXStandardWindow")
+        let legacy = LayoutSnapshot(profileKey: oldKey, profileLabel: "Desk",
+                                    timestamp: Date(timeIntervalSince1970: 1_000_000), windows: [oldWindow])
+        let store = LayoutSnapshotStore(snapshotDirectory: directory, loadExisting: false, screenDetector: detector)
+        XCTAssertTrue(store.save(snapshot: legacy))
+        let originalFile = try XCTUnwrap(store.snapshotFileURL(for: oldKey))
+        let migrated = try XCTUnwrap(store.load(profileKey: "uuid-main"))
+        XCTAssertEqual(migrated.windows.first?.screenKey, "uuid-main")
+        XCTAssertEqual(migrated.windows.first?.relativeFrame, oldWindow.relativeFrame)
+        XCTAssertEqual(migrated.timestamp, legacy.timestamp)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: originalFile.path))
+        let reloaded = LayoutSnapshotStore(snapshotDirectory: directory, screenDetector: detector)
+        XCTAssertEqual(reloaded.load(profileKey: "uuid-main")?.windows, migrated.windows)
+    }
+
+    func testAmbiguousLegacyDisplaysAreNotMigratedByGuessing() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let detector = ScreenDetector(shouldRegisterCallback: false)
+        detector.setStateForTesting(screens: [legacyScreen(id: 1, uuid: "uuid-a", serial: 0),
+                                             legacyScreen(id: 2, uuid: "uuid-b", serial: 0)])
+        let store = LayoutSnapshotStore(snapshotDirectory: directory, loadExisting: false, screenDetector: detector)
+        let legacy = LayoutSnapshot(profileKey: "1-101-0+1-101-0", profileLabel: "Desk", timestamp: Date(), windows: [])
+        XCTAssertTrue(store.save(snapshot: legacy))
+        XCTAssertNil(store.load(profileKey: "uuid-a+uuid-b"))
+        XCTAssertNotNil(store.load(profileKey: legacy.profileKey))
+        XCTAssertEqual(store.savedProfileCount, 1)
+    }
+
+    private func legacyScreen(id: UInt32, uuid: String, serial: UInt32) -> ScreenInfo {
+        ScreenInfo(displayID: id, name: "Main", frame: CGRect(x: 0, y: 0, width: 1200, height: 800),
+                   isBuiltIn: false, position: .single, vendorID: 1, modelID: 101,
+                   serialNumber: serial, persistentID: uuid)
+    }
+
+    func testFailedWriteDoesNotPublishOrCacheSnapshot() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("not a directory".utf8).write(to: directory)
+        let store = LayoutSnapshotStore(snapshotDirectory: directory, loadExisting: false)
+        store.save(snapshot: LayoutSnapshot(profileKey: "desk", profileLabel: "Desk", timestamp: Date(), windows: []))
+        XCTAssertNil(store.load(profileKey: "desk"))
+        XCTAssertEqual(store.savedProfileCount, 0)
+    }
+
     func testSnapshotFileURLReturnsSavedJSONForProfile() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = LayoutSnapshotStore(snapshotDirectory: directory, loadExisting: false)

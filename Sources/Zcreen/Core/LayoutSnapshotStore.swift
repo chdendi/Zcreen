@@ -14,8 +14,18 @@ class LayoutSnapshotStore: ObservableObject {
     /// by another screen change while displays were still settling) cancels the
     /// previous chain instead of stacking moves on top.
     private var restoreGeneration: UInt64 = 0
+    private let scheduleAfter: (TimeInterval, @escaping () -> Void) -> Void
+    private let runningBundleIds: () -> Set<String>
 
-    init(snapshotDirectory: URL? = nil, loadExisting: Bool = true, screenDetector: ScreenDetector? = nil) {
+    init(snapshotDirectory: URL? = nil, loadExisting: Bool = true, screenDetector: ScreenDetector? = nil,
+         scheduleAfter: @escaping (TimeInterval, @escaping () -> Void) -> Void = { delay, action in
+             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action)
+         },
+         runningBundleIds: @escaping () -> Set<String> = {
+             Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+         }) {
+        self.scheduleAfter = scheduleAfter
+        self.runningBundleIds = runningBundleIds
         let configDir = snapshotDirectory ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/zcreen/snapshots")
         self.snapshotDir = configDir
@@ -31,10 +41,8 @@ class LayoutSnapshotStore: ObservableObject {
         self.screenDetector = detector
     }
 
-    func save(snapshot: LayoutSnapshot) {
-        cache[snapshot.profileKey] = snapshot
-        savedProfileCount = cache.count
-
+    @discardableResult
+    func save(snapshot: LayoutSnapshot) -> Bool {
         let fileURL = snapshotDir.appendingPathComponent("\(fileNameHash(snapshot.profileKey)).json")
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -42,15 +50,40 @@ class LayoutSnapshotStore: ObservableObject {
 
         do {
             let data = try encoder.encode(snapshot)
-            try data.write(to: fileURL)
+            try data.write(to: fileURL, options: .atomic)
+            cache[snapshot.profileKey] = snapshot
+            savedProfileCount = cache.count
             Log.snapshot.info("Saved snapshot for '\(snapshot.profileLabel)' (\(snapshot.windows.count) windows)")
+            return true
         } catch {
             Log.snapshot.error("Failed to save snapshot: \(error.localizedDescription)")
+            return false
         }
     }
 
     func load(profileKey: String) -> LayoutSnapshot? {
-        cache[profileKey]
+        cache[profileKey] ?? migrateLegacySnapshot(profileKey: profileKey)
+    }
+
+    private func migrateLegacySnapshot(profileKey: String) -> LayoutSnapshot? {
+        guard let screens = screenDetector?.screens, !screens.isEmpty,
+              screens.map(\.uniqueKey).sorted().joined(separator: "+") == profileKey else { return nil }
+        let legacyKeys = screens.map { "\($0.vendorID)-\($0.modelID)-\($0.serialNumber)" }
+        // A zero serial number may have collapsed two identical displays in the old
+        // format. Preserve that file rather than guessing which monitor it meant.
+        guard Set(legacyKeys).count == screens.count,
+              let old = cache[legacyKeys.sorted().joined(separator: "+")] else { return nil }
+        let mapping = Dictionary(uniqueKeysWithValues: zip(legacyKeys, screens.map(\.uniqueKey)))
+        let migrated = LayoutSnapshot(profileKey: profileKey, profileLabel: old.profileLabel,
+            timestamp: old.timestamp, windows: old.windows.map { window in
+                WindowSnapshot(bundleId: window.bundleId, appName: window.appName, windowTitle: window.windowTitle,
+                    frame: window.frame, screenName: window.screenName,
+                    screenKey: window.screenKey.flatMap { mapping[$0] ?? $0 }, relativeFrame: window.relativeFrame,
+                    windowRole: window.windowRole, windowSubrole: window.windowSubrole)
+            })
+        guard save(snapshot: migrated) else { return nil }
+        Log.snapshot.info("Migrated legacy snapshot to UUID profile; original file preserved")
+        return migrated
     }
 
     func savedProfiles() -> [(key: String, label: String, windowCount: Int, date: Date)] {
@@ -114,147 +147,82 @@ class LayoutSnapshotStore: ObservableObject {
         )
     }
 
+    func cancelRestore() { restoreGeneration &+= 1 }
+
     func restoreSnapshot(_ snapshot: LayoutSnapshot, windowManager: WindowManager, excludeBundleIds: Set<String>,
                          excludeAppMatchers: [AppMatcher] = [], windowFilter: WindowFilter) {
-        restoreGeneration &+= 1
-        let generation = restoreGeneration
-        let missed = doRestore(snapshot: snapshot, windowManager: windowManager,
-                               excludeBundleIds: excludeBundleIds,
-                               excludeAppMatchers: excludeAppMatchers,
-                               windowFilter: windowFilter)
-
-        if !missed.isEmpty {
-            scheduleRetry(snapshot: snapshot, windowManager: windowManager,
-                          excludeBundleIds: excludeBundleIds,
-                          excludeAppMatchers: excludeAppMatchers,
-                          windowFilter: windowFilter,
-                          missed: missed, attempt: 1, generation: generation)
-        }
+        cancelRestore()
+        restorePending(snapshot: snapshot, windowManager: windowManager, excludeBundleIds: excludeBundleIds,
+                       excludeAppMatchers: excludeAppMatchers, windowFilter: windowFilter,
+                       completedWindows: [], attempt: 0, generation: restoreGeneration)
     }
 
-    // MARK: - Exponential backoff retry
-
-    private func scheduleRetry(snapshot: LayoutSnapshot, windowManager: WindowManager,
-                               excludeBundleIds: Set<String>, excludeAppMatchers: [AppMatcher],
-                               windowFilter: WindowFilter,
-                               missed: [String], attempt: Int, generation: UInt64) {
-        let maxRetries = Constants.Timing.snapshotMaxRetries
-        guard attempt <= maxRetries else {
-            Log.snapshot.info("RESTORE: gave up after \(maxRetries) retries, \(missed.count) apps still inaccessible")
-            return
+    private func restorePending(snapshot: LayoutSnapshot, windowManager: WindowManager,
+                                excludeBundleIds: Set<String>, excludeAppMatchers: [AppMatcher],
+                                windowFilter: WindowFilter, completedWindows: [AXUIElement],
+                                attempt: Int, generation: UInt64) {
+        guard generation == restoreGeneration else { return }
+        let allWindows = windowManager.getAllWindows(filter: windowFilter).filter { window in
+            !completedWindows.contains { CFEqual($0, window.axWindow) } &&
+                !isExcluded(bundleId: window.bundleId, appName: window.appName,
+                            excludeBundleIds: excludeBundleIds, excludeAppMatchers: excludeAppMatchers)
         }
-        // A newer restore has started — abandon this chain instead of fighting it.
-        guard generation == restoreGeneration else {
-            Log.snapshot.info("RESTORE: aborting stale retry chain (gen=\(generation) current=\(self.restoreGeneration))")
-            return
-        }
-
-        // Exponential backoff: 1s → 2s → 4s
-        let delay = Constants.Timing.snapshotRetryBaseDelay * pow(2.0, Double(attempt - 1))
-        Log.snapshot.info("RESTORE: \(missed.count) apps missed, retry \(attempt)/\(maxRetries) in \(delay)s...")
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
-            guard generation == self.restoreGeneration else {
-                Log.snapshot.info("RESTORE: skipping retry, superseded by gen=\(self.restoreGeneration)")
-                return
-            }
-            let stillMissed = self.doRestore(snapshot: snapshot, windowManager: windowManager,
-                                             excludeBundleIds: excludeBundleIds,
-                                             excludeAppMatchers: excludeAppMatchers,
-                                             windowFilter: windowFilter)
-            if !stillMissed.isEmpty {
-                self.scheduleRetry(snapshot: snapshot, windowManager: windowManager,
-                                   excludeBundleIds: excludeBundleIds,
-                                   excludeAppMatchers: excludeAppMatchers,
-                                   windowFilter: windowFilter,
-                                   missed: stillMissed, attempt: attempt + 1,
-                                   generation: generation)
-            }
-        }
-    }
-
-    /// Returns bundle IDs of apps that were in snapshot but couldn't be found/moved.
-    @discardableResult
-    private func doRestore(snapshot: LayoutSnapshot, windowManager: WindowManager,
-                           excludeBundleIds: Set<String>, excludeAppMatchers: [AppMatcher],
-                           windowFilter: WindowFilter) -> [String] {
-        let allWindows = windowManager.getAllWindows(filter: windowFilter)
         let currentScreens = currentScreensSnapshot()
-        Log.snapshot.info("RESTORE: snapshot has \(snapshot.windows.count) saved, \(allWindows.count) running")
-
-        var savedByBundle: [String: [WindowSnapshot]] = [:]
-        for w in snapshot.windows where !isExcluded(
-            bundleId: w.bundleId,
-            appName: w.appName,
-            excludeBundleIds: excludeBundleIds,
-            excludeAppMatchers: excludeAppMatchers
-        ) && windowFilter.allows(snapshot: w) {
-            savedByBundle[w.bundleId, default: []].append(w)
+        let activeApps = runningBundleIds()
+        let savedWindows = snapshot.windows.filter {
+            !isExcluded(bundleId: $0.bundleId, appName: $0.appName,
+                        excludeBundleIds: excludeBundleIds, excludeAppMatchers: excludeAppMatchers) &&
+                windowFilter.allows(snapshot: $0)
         }
+        let savedByBundle = Dictionary(grouping: savedWindows, by: \.bundleId)
+        let runningByBundle = Dictionary(grouping: allWindows, by: { $0.bundleId ?? "" })
+        var pending: [WindowSnapshot] = []
+        var completed = completedWindows
+        var requested = 0
+        Log.snapshot.info("RESTORE: profile '\(snapshot.profileLabel)', attempt \(attempt), \(savedWindows.count) pending saved windows, \(allWindows.count) available")
 
-        var runningByBundle: [String: [WindowManager.WindowInfo]] = [:]
-        for w in allWindows {
-            let bid = w.bundleId ?? ""
-            if !isExcluded(
-                bundleId: bid,
-                appName: w.appName,
-                excludeBundleIds: excludeBundleIds,
-                excludeAppMatchers: excludeAppMatchers
-            ) {
-                runningByBundle[bid, default: []].append(w)
-            }
-        }
-
-        var restored = 0
-        var missed: [String] = []
-
-        for (bundleId, savedWindows) in savedByBundle {
-            guard let runningWindows = runningByBundle[bundleId] else {
-                if NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == bundleId }) {
-                    missed.append(bundleId)
-                    Log.snapshot.info("RESTORE: \(savedWindows.first?.appName ?? bundleId) — running but AX returned 0 windows")
-                }
+        for (bundleId, saved) in savedByBundle {
+            let running = runningByBundle[bundleId] ?? []
+            guard !running.isEmpty else {
+                if activeApps.contains(bundleId) { pending.append(contentsOf: saved) }
                 continue
             }
-
-            let candidates = runningWindows.map { running -> WindowMatchCandidate in
-                let screen = currentScreenContext(for: running.frame, in: currentScreens)
-                return WindowMatchCandidate(
-                    title: running.title,
-                    frame: running.frame,
-                    screenName: screen.name,
-                    screenKey: screen.key,
-                    role: running.role,
-                    subrole: running.subrole
-                )
+            let candidates = running.map { window -> WindowMatchCandidate in
+                let screen = currentScreenContext(for: window.frame, in: currentScreens)
+                return WindowMatchCandidate(title: window.title, frame: window.frame, screenName: screen.name,
+                    screenKey: screen.key, role: window.role, subrole: window.subrole)
             }
-            let assignments = WindowMatcher
-                .match(saved: savedWindows, running: candidates)
-                .sorted { $0.savedIndex < $1.savedIndex }
-
-            for assignment in assignments {
-                let savedWin = savedWindows[assignment.savedIndex]
-                let runningWin = runningWindows[assignment.runningIndex]
-                let target = savedWin.resolvedFrame(using: currentScreens)
+            let assignments = WindowMatcher.match(saved: saved, running: candidates)
+            let matched = Set(assignments.map(\.savedIndex))
+            for assignment in assignments.sorted(by: { $0.savedIndex < $1.savedIndex }) {
+                let savedWindow = saved[assignment.savedIndex]
+                let target = savedWindow.resolvedFrame(using: currentScreens)
+                let window = running[assignment.runningIndex].axWindow
                 let confidence = assignment.isLowConfidence ? "low-confidence" : "matched"
-                let titleLabel = savedWin.windowTitle?.isEmpty == false
-                    ? savedWin.windowTitle!
-                    : savedWin.appName
-
-                Log.snapshot.info("RESTORE: \(confidence) '\(titleLabel)' [score=\(assignment.score)] → (\(Int(target.origin.x)),\(Int(target.origin.y)),\(Int(target.width))x\(Int(target.height)))")
-                windowManager.moveWindow(runningWin.axWindow, toFrame: target)
-                restored += 1
+                Log.snapshot.info("RESTORE: \(confidence) '\(savedWindow.windowTitle ?? savedWindow.appName)' [score=\(assignment.score)] → \(target)")
+                windowManager.moveWindow(window, toFrame: target)
+                completed.append(window)
+                requested += 1
             }
-
-            if assignments.count < savedWindows.count {
-                let unmatchedCount = savedWindows.count - assignments.count
-                Log.snapshot.info("RESTORE: \(savedWindows.first?.appName ?? bundleId) has \(unmatchedCount) saved windows without running match")
+            if activeApps.contains(bundleId) {
+                pending.append(contentsOf: saved.enumerated().filter { !matched.contains($0.offset) }.map(\.element))
             }
         }
-
-        Log.snapshot.info("RESTORE: moved \(restored) windows for '\(snapshot.profileLabel)'")
-        return missed
+        Log.snapshot.info("RESTORE: requested \(requested) window moves; \(pending.count) windows pending")
+        guard !pending.isEmpty else { return }
+        guard attempt < Constants.Timing.snapshotMaxRetries else {
+            Log.snapshot.warning("RESTORE: retry limit reached; \(pending.count) saved windows remain unmatched")
+            return
+        }
+        let remaining = LayoutSnapshot(profileKey: snapshot.profileKey, profileLabel: snapshot.profileLabel,
+                                       timestamp: snapshot.timestamp, windows: pending)
+        let delay = Constants.Timing.snapshotRetryBaseDelay * pow(2, Double(attempt))
+        scheduleAfter(delay) { [weak self] in
+            self?.restorePending(snapshot: remaining, windowManager: windowManager,
+                excludeBundleIds: excludeBundleIds, excludeAppMatchers: excludeAppMatchers,
+                windowFilter: windowFilter, completedWindows: completed, attempt: attempt + 1,
+                generation: generation)
+        }
     }
 
     private func isExcluded(bundleId: String?, appName: String?, excludeBundleIds: Set<String>,

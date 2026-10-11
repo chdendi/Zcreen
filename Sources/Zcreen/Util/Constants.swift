@@ -43,8 +43,8 @@ enum Constants {
     }
 
     enum Timing {
-        /// 屏幕变化 throttle 间隔 (ms)，begin/settle 状态机后 latest-event 触发延迟。
-        static let screenChangeDebounceMs: Int = 100
+        /// 屏幕重配置静默间隔 (ms)，每次事件重新计时后再读取稳定拓扑。
+        static let screenChangeDebounceMs: Int = 500
         /// 系统从 sleep / lock 唤醒后等待"期望 profile"重新出现的 debounce 超时 (s)。
         /// 唤醒时 macOS 会按显示器逐块发送 reconfig 事件（在多屏 + 外接屏环境中
         /// 间隔可达数秒），自适应状态机用 expectedProfileKey 启发匹配 + 这个 timeout

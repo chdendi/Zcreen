@@ -180,7 +180,7 @@ final class RuleApplyServiceTests: XCTestCase {
             for: fixture.portrait, screens: fixture.screens
         )).contains(frame))
         XCTAssertTrue(fixture.manager.fallbackMoves.isEmpty)
-        XCTAssertEqual(orchestrator.lastAction, "Restored layout for Desk")
+        XCTAssertEqual(orchestrator.lastAction, "Restoring layout for Desk")
     }
 
     func testUnavailableRuleTargetKeepsOrdinarySnapshotRestore() throws {

@@ -10,7 +10,8 @@ Usage:
 Environment:
   APP_NAME            App bundle name (default: Zcreen)
   BUILD_CONFIGURATION swift build configuration (default: release)
-  BUILD_DIR           Swift build output directory (default: .build/<configuration>)
+  BUILD_DIR           Swift build output directory (default: resolved by SwiftPM)
+  UNIVERSAL_BUILD     Set to 1 to build both arm64 and x86_64 (default: 0).
   OUTPUT_DIR          Directory where the .app bundle will be created (default: .)
   SIGN_IDENTITY       Codesign identity. Use "-" for ad-hoc signing (default).
   VERSION             Version to write into the generated app bundle Info.plist.
@@ -22,7 +23,8 @@ export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Develope
 
 APP_NAME="${APP_NAME:-Zcreen}"
 BUILD_CONFIGURATION="${BUILD_CONFIGURATION:-release}"
-BUILD_DIR="${BUILD_DIR:-.build/${BUILD_CONFIGURATION}}"
+BUILD_DIR="${BUILD_DIR:-}"
+UNIVERSAL_BUILD="${UNIVERSAL_BUILD:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-.}"
 INFO_PLIST_SOURCE="${INFO_PLIST_SOURCE:-Sources/Zcreen/App/Info.plist}"
 ICON_SOURCE="${ICON_SOURCE:-Sources/Zcreen/App/AppIcon.icns}"
@@ -83,9 +85,17 @@ CONTENTS="${APP_BUNDLE}/Contents"
 MACOS="${CONTENTS}/MacOS"
 RESOURCES="${CONTENTS}/Resources"
 
+build_args=(-c "${BUILD_CONFIGURATION}")
+if [[ "${UNIVERSAL_BUILD}" == "1" ]]; then
+    build_args+=(--arch arm64 --arch x86_64)
+fi
+
 if [[ "${SKIP_BUILD}" != "1" ]]; then
     echo "==> Building ${BUILD_CONFIGURATION} target..."
-    swift build -c "${BUILD_CONFIGURATION}"
+    swift build "${build_args[@]}"
+fi
+if [[ -z "${BUILD_DIR}" ]]; then
+    BUILD_DIR="$(swift build "${build_args[@]}" --show-bin-path)"
 fi
 
 echo "==> Creating app bundle in ${OUTPUT_DIR}..."

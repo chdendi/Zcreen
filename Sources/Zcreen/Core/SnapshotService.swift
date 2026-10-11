@@ -16,6 +16,7 @@ final class SnapshotService {
         case saved(windowCount: Int)
         case noWindows
         case unchanged
+        case failed
 
         var statusMessage: String? {
             switch self {
@@ -25,6 +26,8 @@ final class SnapshotService {
                 return "No windows available to save"
             case .unchanged:
                 return nil
+            case .failed:
+                return "Could not save layout. Check the logs and retry."
             }
         }
     }
@@ -36,7 +39,7 @@ final class SnapshotService {
         var statusMessage: String {
             switch self {
             case let .restored(profileLabel):
-                return "Restored layout for \(profileLabel)"
+                return "Restoring layout for \(profileLabel)"
             case let .missing(profileLabel):
                 return "No saved layout for \(profileLabel)"
             }
@@ -68,13 +71,15 @@ final class SnapshotService {
             windowFilter: WindowFilter(configuration: configuration)
         )
 
-        guard !captured.windows.isEmpty else {
+        let existing = snapshotStore.load(profileKey: captured.profileKey)
+        let snapshot = merging(captured: captured, into: existing)
+
+        // Empty AX captures cannot erase saved positions. Explicit exclusions may
+        // still remove old entries, even when every current app is excluded.
+        if captured.windows.isEmpty, existing == nil || existing?.windows == snapshot.windows {
             Log.snapshot.info("Skipped snapshot save [\(trigger.logLabel)] because no windows were captured")
             return .noWindows
         }
-
-        let existing = snapshotStore.load(profileKey: captured.profileKey)
-        let snapshot = merging(captured: captured, into: existing)
 
         if !force,
            let existing,
@@ -83,7 +88,7 @@ final class SnapshotService {
             return .unchanged
         }
 
-        snapshotStore.save(snapshot: snapshot)
+        guard snapshotStore.save(snapshot: snapshot) else { return .failed }
         Log.snapshot.info("Saved snapshot [\(trigger.logLabel)] for '\(snapshot.profileLabel)'")
         return .saved(windowCount: snapshot.windows.count)
     }
@@ -97,7 +102,10 @@ final class SnapshotService {
         guard let existing else { return captured }
 
         let capturedBundleIds = Set(captured.windows.map(\.bundleId))
-        let preserved = existing.windows.filter { !capturedBundleIds.contains($0.bundleId) }
+        let filter = WindowFilter(configuration: configManager.configuration)
+        let preserved = existing.windows.filter { window in
+            !capturedBundleIds.contains(window.bundleId) && filter.allows(snapshot: window)
+        }
         guard !preserved.isEmpty else { return captured }
 
         Log.snapshot.info("Snapshot merge preserved \(preserved.count) windows from apps missing in this capture")
@@ -124,7 +132,7 @@ final class SnapshotService {
             profileKey: profileKey,
             profileLabel: profileLabel,
             successLogMessage: { snapshot in
-                "Restored \(snapshot.windows.count) windows for '\(snapshot.profileLabel)'"
+                "Requested layout restore for '\(snapshot.profileLabel)' (\(snapshot.windows.count) saved windows)"
             }
         )
     }
@@ -133,6 +141,7 @@ final class SnapshotService {
                                profileLabel: String,
                                successLogMessage: (LayoutSnapshot) -> String) -> RestoreResult {
         guard let snapshot = snapshotStore.load(profileKey: profileKey) else {
+            snapshotStore.cancelRestore()
             return .missing(profileLabel: profileLabel)
         }
 
@@ -158,7 +167,4 @@ final class SnapshotService {
         return .restored(profileLabel: snapshot.profileLabel)
     }
 
-    private func currentWindowFilter() -> WindowFilter {
-        WindowFilter(configuration: configManager.configuration)
-    }
 }

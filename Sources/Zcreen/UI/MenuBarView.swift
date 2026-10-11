@@ -10,6 +10,8 @@ struct MenuBarView: View {
         VStack(spacing: 0) {
             HeaderSection(orchestrator: orchestrator)
 
+            if !accessibilityOK { PermissionBanner(accessibilityOK: $accessibilityOK) }
+
             if orchestrator.autoUpdater.updateAvailable {
                 UpdateBanner(updater: orchestrator.autoUpdater)
             }
@@ -21,6 +23,7 @@ struct MenuBarView: View {
             }
 
             ScreenListSection(screens: orchestrator.screenDetector.screens, hoveredButton: $hoveredButton)
+            QuickActionsSection(orchestrator: orchestrator)
 
             if !orchestrator.lastAction.isEmpty {
                 statusSection

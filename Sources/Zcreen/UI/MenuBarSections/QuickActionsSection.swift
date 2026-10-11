@@ -39,6 +39,9 @@ struct QuickActionsSection: View {
                         orchestrator.configManager.openSnapshotsDirectory()
                     }
                 }
+                actionButton(title: "Feedback", icon: "bubble.left.and.bubble.right") {
+                    FeedbackController.shared.present()
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)

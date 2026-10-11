@@ -1,0 +1,19 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run regression tests
+        run: swift test
+      - name: Build Apple Silicon and Intel release
+        run: swift build -c release --arch arm64 --arch x86_64

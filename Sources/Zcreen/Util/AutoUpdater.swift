@@ -6,12 +6,13 @@ final class AutoUpdater: ObservableObject {
     @Published private(set) var latestVersion = ""
     @Published private(set) var isChecking = false
     @Published private(set) var isDownloading = false
+    @Published private(set) var errorMessage: String?
 
     private(set) var releaseURL: URL?
     private(set) var downloadURL: URL?
 
     private let currentVersion: String
-    private static let repoAPI = "https://api.github.com/repos/hgDendi/Zcreen/releases/latest"
+    private static let repoAPI = "https://api.github.com/repos/chdendi/Zcreen/releases/latest"
 
     init(autoCheckOnLaunch: Bool = true) {
         currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
@@ -44,15 +45,23 @@ final class AutoUpdater: ObservableObject {
         }
         guard let downloadURL, !isDownloading else { return }
         isDownloading = true
+        errorMessage = nil
 
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ZcreenUpdate-\(UUID().uuidString)")
-        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        } catch {
+            failUpdate(error.localizedDescription)
+            return
+        }
 
-        URLSession.shared.downloadTask(with: downloadURL) { [weak self] fileURL, _, error in
-            guard let self, let fileURL, error == nil else {
-                DispatchQueue.main.async { self?.isDownloading = false }
-                Log.general.error("Auto-update download failed: \(error?.localizedDescription ?? "unknown")")
+        URLSession.shared.downloadTask(with: downloadURL) { [weak self] fileURL, response, error in
+            guard let self else { try? FileManager.default.removeItem(at: tempDir); return }
+            guard let fileURL, error == nil, let response = response as? HTTPURLResponse,
+                  (200..<300).contains(response.statusCode) else {
+                try? FileManager.default.removeItem(at: tempDir)
+                self.failUpdate(error?.localizedDescription ?? "Download request failed. Please retry.")
                 return
             }
             self.installFromZip(fileURL, tempDir: tempDir)
@@ -71,21 +80,24 @@ final class AutoUpdater: ObservableObject {
     private func performCheck() {
         guard !isChecking else { return }
         isChecking = true
+        errorMessage = nil
 
         guard let url = URL(string: Self.repoAPI) else { return }
         var request = URLRequest(url: url)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.cachePolicy = .reloadIgnoringLocalCacheData
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isChecking = false
+                guard let data, error == nil, let response = response as? HTTPURLResponse,
+                      response.statusCode == 200,
+                      let release = try? JSONDecoder().decode(GitHubRelease.self, from: data) else {
+                    self.errorMessage = "Could not check for updates. Please retry."
+                    return
+                }
                 UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastUpdateCheck")
-
-                guard let data, error == nil,
-                      let release = try? JSONDecoder().decode(GitHubRelease.self, from: data)
-                else { return }
 
                 let remote = release.tagName.hasPrefix("v")
                     ? String(release.tagName.dropFirst())
@@ -96,10 +108,14 @@ final class AutoUpdater: ObservableObject {
                     self.latestVersion = remote
                     self.releaseURL = URL(string: release.htmlURL)
                     self.downloadURL = release.assets
-                        .first { $0.name.hasSuffix(".zip") }
+                        .first { $0.name == "Zcreen-v\(remote).zip" }
                         .flatMap { URL(string: $0.browserDownloadURL) }
                     Log.general.info("Update available: \(self.currentVersion) → \(remote)")
                 } else {
+                    self.updateAvailable = false
+                    self.latestVersion = ""
+                    self.downloadURL = nil
+                    self.releaseURL = nil
                     Log.general.info("Up to date: \(self.currentVersion)")
                 }
             }
@@ -117,8 +133,8 @@ final class AutoUpdater: ObservableObject {
             let unzip = Process()
             unzip.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
             unzip.arguments = ["-o", zipPath.path, "-d", tempDir.path]
-            unzip.standardOutput = nil
-            unzip.standardError = nil
+            unzip.standardOutput = FileHandle.nullDevice
+            unzip.standardError = FileHandle.nullDevice
             try unzip.run()
             unzip.waitUntilExit()
 
@@ -128,44 +144,53 @@ final class AutoUpdater: ObservableObject {
 
             // Find .app in extracted contents
             let contents = try FileManager.default.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: nil)
-            guard let newApp = contents.first(where: { $0.pathExtension == "app" }) else {
+            guard let newApp = contents.first(where: { $0.lastPathComponent == "Zcreen.app" }) else {
                 throw UpdateError.noAppFound
             }
 
             let currentApp = Bundle.main.bundleURL
             let pid = ProcessInfo.processInfo.processIdentifier
 
-            // Shell script: wait for current process to exit → swap → relaunch → cleanup
-            let script = """
-            #!/bin/bash
-            while kill -0 \(pid) 2>/dev/null; do sleep 0.1; done
-            rm -rf "\(currentApp.path)"
-            cp -R "\(newApp.path)" "\(currentApp.path)"
-            open "\(currentApp.path)"
-            rm -rf "\(tempDir.path)"
-            rm -f "$0"
-            """
-
+            let prepared = try UpdateInstaller().prepare(newApp: newApp, currentApp: currentApp)
             let scriptURL = tempDir.appendingPathComponent("zcreen_update.sh")
-            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o755], ofItemAtPath: scriptURL.path
-            )
-
+            let ready = tempDir.appendingPathComponent("ready")
             let launcher = Process()
-            launcher.executableURL = URL(fileURLWithPath: "/bin/bash")
-            launcher.arguments = [scriptURL.path]
-            try launcher.run()
+            do {
+                try UpdateInstaller.replacementScript.write(to: scriptURL, atomically: true, encoding: .utf8)
+                launcher.executableURL = URL(fileURLWithPath: "/bin/bash")
+                launcher.arguments = [scriptURL.path, String(pid), currentApp.path,
+                    prepared.replacement.path, prepared.backup.path, tempDir.path, ready.path, "/usr/bin/open"]
+                launcher.standardOutput = FileHandle.nullDevice
+                launcher.standardError = FileHandle.nullDevice
+                try launcher.run()
+                for _ in 0..<50 {
+                    if FileManager.default.fileExists(atPath: ready.path) || !launcher.isRunning { break }
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
+                guard launcher.isRunning, FileManager.default.fileExists(atPath: ready.path) else {
+                    throw UpdateInstaller.InstallerError.helperFailed
+                }
+            } catch {
+                if launcher.isRunning { launcher.terminate(); launcher.waitUntilExit() }
+                try? FileManager.default.removeItem(at: prepared.stagingDirectory)
+                throw error
+            }
 
             Log.general.info("Auto-update: replacement script launched, terminating app")
             DispatchQueue.main.async {
                 NSApplication.shared.terminate(nil)
             }
         } catch {
-            DispatchQueue.main.async { [weak self] in
-                self?.isDownloading = false
-            }
-            Log.general.error("Auto-update install failed: \(error)")
+            try? FileManager.default.removeItem(at: tempDir)
+            failUpdate(error.localizedDescription)
+        }
+    }
+
+    private func failUpdate(_ message: String) {
+        Log.general.error("Auto-update failed: \(message)")
+        DispatchQueue.main.async { [weak self] in
+            self?.isDownloading = false
+            self?.errorMessage = message
         }
     }
 

@@ -24,7 +24,7 @@
 ### 1. Auto Save & Restore Window Layout
 
 - Saves every window's exact position per screen combination
-- Identifies physical monitors by hardware fingerprint (vendor + model + serial)
+- Identifies physical monitors by display UUID, falling back to a hardware fingerprint when unavailable
 - Restores the matching layout when displays reconnect
 - Portrait displays, mixed resolutions, any arrangement
 
@@ -46,6 +46,14 @@ Drag a window and a floating layout bar appears at the top. Release to snap:
 ### 3. Caffeinate — Keep Awake
 
 One-click prevent display sleep from the menu bar. Duration: 1h / 2h / 4h with countdown.
+
+### 4. Feedback
+
+Open the menu bar panel and click `Feedback`, or click the Zcreen icon at the top left **five times**, with no more than two seconds between clicks. Describe the problem and optionally attach logs from the last two days (up to 4 MB in total, taking the latest contents when truncated). Confirmation creates an email draft addressed to `hg.dendi@gmail.com`. Review the attachment, then click Send in your mail app.
+
+Logs may contain app names and window titles. They are packaged only after confirmation. If no compatible mail account is available, use `Open Package` to send the ZIP manually. `Logs` still opens the original log directory.
+
+Automatic updates verify the Bundle ID and Developer ID signing team, stage the complete replacement, and roll back if replacement or opening fails. Successful updates retain the previous app at `.ZcreenUpdate-*/Previous.app` beside the installed app. Ad-hoc signed source builds require manual updates.
 
 ## Install
 

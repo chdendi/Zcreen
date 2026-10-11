@@ -149,7 +149,7 @@ mkdir -p "${ARTIFACT_DIR}"
 rm -rf "${APP_BUNDLE}" "${ZIP_NAME}" "${DMG_NAME}"
 
 echo "==> Building app bundle..."
-bash Scripts/bundle.sh \
+UNIVERSAL_BUILD=1 bash Scripts/bundle.sh \
     --version "${VERSION}" \
     --sign-identity "${SIGN_IDENTITY}" \
     --output-dir "${ARTIFACT_DIR}"

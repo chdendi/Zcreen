@@ -3,8 +3,7 @@ import AppKit
 
 struct HeaderSection: View {
     @ObservedObject var orchestrator: Orchestrator
-    @State private var secretTapCount = 0
-    @State private var lastSecretTap = Date.distantPast
+    @State private var feedbackGesture = FeedbackGesture()
 
     private var screenDetector: ScreenDetector { orchestrator.screenDetector }
     private var snapshotStore: LayoutSnapshotStore { orchestrator.snapshotStore }
@@ -23,17 +22,9 @@ struct HeaderSection: View {
                         .foregroundColor(.white)
                 }
                 .onTapGesture {
-                    let now = Date()
-                    if now.timeIntervalSince(lastSecretTap) > 2 { secretTapCount = 0 }
-                    secretTapCount += 1
-                    lastSecretTap = now
-                    if secretTapCount >= 5 {
-                        let configDir = FileManager.default.homeDirectoryForCurrentUser
-                            .appendingPathComponent(".config/zcreen")
-                        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: configDir.path)
-                        secretTapCount = 0
-                    }
+                    if feedbackGesture.tap() { FeedbackController.shared.present() }
                 }
+                .help("Click five times to open feedback")
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Zcreen")

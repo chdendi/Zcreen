@@ -46,6 +46,14 @@ final class FileLogSink {
 
     var directoryURL: URL { logsDirectory }
 
+    /// Run an export after all previously queued log writes have completed.
+    func flush(_ action: @escaping () -> Void) {
+        queue.async { [weak self] in
+            try? self?.currentHandle?.synchronize()
+            action()
+        }
+    }
+
     func append(level: String, category: String, message: String) {
         let now = Date()
         let timestamp = dateFormatter.string(from: now)

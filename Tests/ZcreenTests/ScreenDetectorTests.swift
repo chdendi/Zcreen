@@ -51,4 +51,37 @@ final class ScreenDetectorTests: XCTestCase {
         wait(for: [changed], timeout: 0.7)
         withExtendedLifetime(subscription) {}
     }
+
+    func testFingerprintTracksGeometryThatProfileKeyIgnores() {
+        let detector = ScreenDetector(shouldRegisterCallback: false)
+        detector.setStateForTesting(screens: [screen(frame: CGRect(x: 0, y: 0, width: 1512, height: 982))])
+        let key = detector.profileKey
+        let fingerprint = detector.topologyFingerprint
+
+        detector.setStateForTesting(screens: [screen(frame: CGRect(x: 0, y: 0, width: 1800, height: 1169))])
+
+        XCTAssertEqual(detector.profileKey, key, "Same physical display, same profile")
+        XCTAssertNotEqual(detector.topologyFingerprint, fingerprint)
+    }
+
+    func testLiveGeometryCheckDetectsDisplaysThatAlreadyChanged() {
+        let detector = ScreenDetector(shouldRegisterCallback: false)
+        let builtIn = screen(frame: CGRect(x: 0, y: 0, width: 1512, height: 982))
+        detector.setStateForTesting(screens: [builtIn])
+        XCTAssertTrue(detector.liveGeometryMatchesScreens())
+
+        detector.setStateForTesting(screens: [builtIn], liveGeometry: [
+            .init(displayID: builtIn.displayID, frame: builtIn.frame),
+            .init(displayID: 7, frame: CGRect(x: 1512, y: 0, width: 2560, height: 1440)),
+        ])
+        XCTAssertFalse(detector.liveGeometryMatchesScreens())
+
+        detector.setStateForTesting(screens: [builtIn], liveGeometry: [])
+        XCTAssertTrue(detector.liveGeometryMatchesScreens(), "Unknown live state must not block saves")
+    }
+
+    private func screen(frame: CGRect) -> ScreenInfo {
+        ScreenInfo(displayID: 1, name: "Built-in Retina Display", frame: frame, isBuiltIn: true,
+                   position: .single, vendorID: 1, modelID: 101, serialNumber: 1001, persistentID: "uuid-builtin")
+    }
 }

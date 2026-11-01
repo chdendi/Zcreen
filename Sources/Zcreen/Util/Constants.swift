@@ -54,10 +54,22 @@ enum Constants {
         /// cooldown 期内的 reconfig 事件被吸收（不再 restore），只有 profile 漂回
         /// expected 才会再次 restore。避免 macOS 反复抖动外接屏 mode 时窗口连跳。
         static let wakeSettleCooldownDelay: TimeInterval = 4.0
+        /// 唤醒后出现挂起前没有的显示器（换了一套屏幕）时的等待超时 (s)。
+        /// 这种情况不可能等到 expected profile，没必要等满 wakeSettleDelay。
+        static let wakeSettleForeignDisplayDelay: TimeInterval = 2.0
         /// 定时自动保存布局间隔 (s)
         static let layoutAutoSaveInterval: TimeInterval = 15
+        /// 定时自动保存的触发容差 (s)，允许系统合并定时器唤醒以省电
+        static let layoutAutoSaveTolerance: TimeInterval = 3
         /// 屏幕变化后延迟保存当前布局 (s) — 给用户更长的手动调整窗口期。
         static let screenChangeAutoSaveDelay: TimeInterval = 5.0
+        /// "显示器重配中"标记在最后一次重配事件后最多保持多久 (s)；超时视为异常卡住并解除，
+        /// 避免所有自动保存被永久阻止。
+        static let reconfigWatchdogDelay: TimeInterval = 30
+        /// 恢复移动窗口后多久复查一次是否到位 (s)
+        static let restoreVerifyDelay: TimeInterval = 1.0
+        /// 恢复中途失败的窗口受保护的最短时长 (s)：期间自动保存不会用当前位置覆盖它们的历史位置
+        static let restoreGuardLifetime: TimeInterval = 120
         /// 配置文件变化重载延迟 (s)
         static let configReloadDelay: TimeInterval = 0.2
         /// 快照恢复重试基础延迟 (s)
@@ -70,6 +82,27 @@ enum Constants {
         static let appLaunchPollMaxAttempts: Int = 10
         /// App 启动规则执行后延迟保存布局 (s)
         static let appLaunchAutoSaveDelay: TimeInterval = 2.0
+    }
+
+    enum Restore {
+        /// 当前位置与目标相差不超过该值 (pt) 视为已在位，不再移动
+        static let inPlaceTolerance: CGFloat = 2
+        /// 复查时偏离目标超过该值 (pt) 视为没放到位
+        static let driftTolerance: CGFloat = 10
+    }
+
+    enum Accessibility {
+        /// 读写其他 app 窗口的 AX 调用超时 (s)。系统默认约 6s，无响应的 app 会拖住主线程。
+        static let messagingTimeout: Float = 1.0
+        /// AX 调用超时的 app 在这段时间内跳过，不再反复等待 (s)
+        static let unresponsiveBackoff: TimeInterval = 60
+    }
+
+    enum SnapshotHistory {
+        /// 自动保存覆盖旧快照时，两次归档之间的最短间隔 (s)
+        static let minArchiveInterval: TimeInterval = 600
+        /// 每个屏幕组合保留的历史版本数
+        static let maxVersions = 30
     }
 
     enum WindowFilter {

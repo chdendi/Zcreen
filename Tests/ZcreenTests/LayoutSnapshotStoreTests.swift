@@ -13,8 +13,7 @@ final class LayoutSnapshotStoreTests: XCTestCase {
         let store = LayoutSnapshotStore(snapshotDirectory: directory, loadExisting: false, runningBundleIds: { [] })
         let snapshot = LayoutSnapshot(profileKey: "main", profileLabel: "Main", timestamp: Date(),
             windows: [makeWindowSnapshot(bundleId: "com.test.app", appName: "Previous Name", title: "Editor")])
-        store.restoreSnapshot(snapshot, windowManager: manager, excludeBundleIds: [],
-            excludeAppMatchers: [AppMatcher(bundleId: nil, nameContains: "Excluded")],
+        store.restoreSnapshot(snapshot, windowManager: manager, excludeAppMatchers: [AppMatcher(bundleId: nil, nameContains: "Excluded")],
             windowFilter: WindowFilter(configuration: .empty))
         XCTAssertEqual(manager.moveWindowCallCount, 0)
     }
@@ -262,12 +261,83 @@ final class LayoutSnapshotStoreTests: XCTestCase {
         store.restoreSnapshot(
             snapshot,
             windowManager: windowManager,
-            excludeBundleIds: [],
             excludeAppMatchers: [AppMatcher(bundleId: "com.mitchellh.ghostty", nameContains: nil)],
             windowFilter: WindowFilter(configuration: .empty)
         )
 
         XCTAssertEqual(windowManager.moveWindowCallCount, 1)
+    }
+
+    func testOverwritesAreArchivedAtMostOncePerIntervalUnlessForced() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = LayoutSnapshotStore(snapshotDirectory: directory, loadExisting: false)
+        let history = store.historyDirectory(for: "desk")
+        func versions() -> Int {
+            ((try? FileManager.default.contentsOfDirectory(atPath: history.path)) ?? []).filter { $0.hasSuffix(".json") }.count
+        }
+        func layout(_ title: String) -> LayoutSnapshot {
+            LayoutSnapshot(profileKey: "desk", profileLabel: "Desk", timestamp: Date(),
+                           windows: [makeWindowSnapshot(bundleId: "com.test.app", appName: "Test", title: title)])
+        }
+
+        XCTAssertTrue(store.save(snapshot: layout("First")))
+        XCTAssertEqual(versions(), 0, "Nothing to archive before the first overwrite")
+        XCTAssertTrue(store.save(snapshot: layout("Second")))
+        XCTAssertEqual(versions(), 1)
+        XCTAssertTrue(store.save(snapshot: layout("Third")))
+        XCTAssertEqual(versions(), 1, "Automatic overwrites within the interval are not archived again")
+
+        Thread.sleep(forTimeInterval: 0.002)
+        store.archiveCurrentVersion(profileKey: "desk", force: true)
+        XCTAssertEqual(versions(), 2)
+
+        let archived = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: history, includingPropertiesForKeys: nil)
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }.first)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let restored = try decoder.decode(LayoutSnapshot.self, from: Data(contentsOf: archived))
+        XCTAssertEqual(restored.windows.first?.windowTitle, "First")
+    }
+
+    func testHistoryKeepsOnlyTheNewestVersions() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = LayoutSnapshotStore(snapshotDirectory: directory, loadExisting: false)
+        store.save(snapshot: LayoutSnapshot(profileKey: "desk", profileLabel: "Desk", timestamp: Date(), windows: []))
+        for _ in 0...Constants.SnapshotHistory.maxVersions {
+            Thread.sleep(forTimeInterval: 0.002)
+            store.archiveCurrentVersion(profileKey: "desk", force: true)
+        }
+        let count = ((try? FileManager.default.contentsOfDirectory(atPath: store.historyDirectory(for: "desk").path)) ?? []).count
+        XCTAssertEqual(count, Constants.SnapshotHistory.maxVersions)
+    }
+
+    func testCaptureLayoutKeepsElementsAlignedWithSortedWindows() {
+        let zed = makeWindowInfo(bundleId: "com.z.app", appName: "Z", title: "Z", frame: CGRect(x: 0, y: 40, width: 600, height: 400))
+        let alpha = makeWindowInfo(bundleId: "com.a.app", appName: "A", title: "A", frame: CGRect(x: 0, y: 40, width: 600, height: 400))
+        let zedElement = AXUIElementCreateApplication(701)
+        let alphaElement = AXUIElementCreateApplication(702)
+        let manager = SnapshotTestWindowManager(windows: [
+            withElement(zed, zedElement), withElement(alpha, alphaElement),
+        ])
+        let store = LayoutSnapshotStore(
+            snapshotDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString),
+            loadExisting: false
+        )
+
+        let captured = store.captureLayout(profileKey: "p", profileLabel: "P", windowManager: manager,
+                                           screens: [], windowFilter: WindowFilter(configuration: .empty))
+
+        XCTAssertEqual(captured.snapshot.windows.map(\.bundleId), ["com.a.app", "com.z.app"])
+        XCTAssertTrue(captured.elements[0].map { CFEqual($0, alphaElement) } == true)
+        XCTAssertTrue(captured.elements[1].map { CFEqual($0, zedElement) } == true)
+    }
+
+    private func withElement(_ window: WindowManager.WindowInfo, _ element: AXUIElement) -> WindowManager.WindowInfo {
+        WindowManager.WindowInfo(pid: window.pid, bundleId: window.bundleId, appName: window.appName, title: window.title,
+                                 role: window.role, subrole: window.subrole, isMinimized: window.isMinimized,
+                                 frame: window.frame, axWindow: element)
     }
 
     private func makeScreen(displayID: CGDirectDisplayID, name: String, frame: CGRect) -> ScreenInfo {
@@ -344,6 +414,10 @@ private final class RestoreCountingWindowManager: WindowManager {
 
     override func getAllWindows() -> [WindowInfo] {
         windows
+    }
+
+    override func getWindows(bundleIds: Set<String>) -> [WindowInfo] {
+        windows.filter { bundleIds.contains($0.bundleId ?? "") }
     }
 
     override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect) {

@@ -346,7 +346,7 @@ private final class RestoreCountingWindowManager: WindowManager {
         windows
     }
 
-    override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect) {
+    override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect, constrainedTo bounds: CGRect? = nil) {
         moveWindowCallCount += 1
     }
 }

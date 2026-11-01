@@ -883,7 +883,7 @@ private final class TestWindowManager: WindowManager {
         moveToScreenCallCount += 1
     }
 
-    override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect) {
+    override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect, constrainedTo bounds: CGRect? = nil) {
         movedFrames.append(frame)
     }
 }

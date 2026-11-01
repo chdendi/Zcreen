@@ -83,5 +83,5 @@ private final class RetryWindowManager: WindowManager {
     var windows: [WindowInfo] = []
     var moves = 0
     override func getAllWindows() -> [WindowInfo] { windows }
-    override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect) { moves += 1 }
+    override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect, constrainedTo bounds: CGRect? = nil) { moves += 1 }
 }

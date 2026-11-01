@@ -47,7 +47,11 @@ Drag a window and a floating layout bar appears at the top. Release to snap:
 
 One-click prevent display sleep from the menu bar. Duration: 1h / 2h / 4h with countdown.
 
-### 4. Feedback
+### 4. Low Disk Space Warning
+
+When the local volume containing your Home folder has strictly less than **10%** available, the menu panel shows a warning and remaining capacity. It stays hidden at exactly 10%, above 10%, or when capacity is unknown. Capacity metadata refreshes at launch, on wake, when opening the panel, and every five minutes. The warning has no disk scanning or cleanup actions.
+
+### 5. Feedback
 
 Open the menu bar panel and click `Feedback`, or click the Zcreen icon at the top left **five times**, with no more than two seconds between clicks. Describe the problem and optionally attach logs from the last two days (up to 4 MB in total, taking the latest contents when truncated). Confirmation creates an email draft addressed to `hg.dendi@gmail.com`. Review the attachment, then click Send in your mail app.
 

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MenuBarView: View {
     @ObservedObject var orchestrator: Orchestrator
+    @ObservedObject var diskSpace: DiskSpaceMonitor
     @State private var launchAtLogin = LoginItemManager.isEnabled
     @State private var hoveredButton: String?
     @State private var accessibilityOK = AccessibilityHelper.isTrusted
@@ -9,6 +10,10 @@ struct MenuBarView: View {
     var body: some View {
         VStack(spacing: 0) {
             HeaderSection(orchestrator: orchestrator)
+
+            if let space = diskSpace.snapshot, space.isLow {
+                LowDiskSpaceWarning(availableBytes: space.availableBytes)
+            }
 
             if !accessibilityOK { PermissionBanner(accessibilityOK: $accessibilityOK) }
 
@@ -34,7 +39,10 @@ struct MenuBarView: View {
             FooterSection(updater: orchestrator.autoUpdater, hoveredButton: $hoveredButton)
         }
         .frame(width: 300)
-        .onAppear { accessibilityOK = AccessibilityHelper.isTrusted }
+        .onAppear {
+            accessibilityOK = AccessibilityHelper.isTrusted
+            diskSpace.refresh()
+        }
         .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
             accessibilityOK = AccessibilityHelper.isTrusted
         }

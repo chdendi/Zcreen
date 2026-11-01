@@ -131,7 +131,7 @@ class WindowManager {
     /// 多段式 set：size → position → size → position；末尾留 setPosition，避免某些 app
     /// 在收到 resize 通知后内部 layout 把 position attribute 又 reset 回去。
     /// 第一轮后如果实际 frame 偏差仍 >5pt，做一次反向兜底（position → size → position）。
-    func moveWindow(_ window: AXUIElement, toFrame frame: CGRect) {
+    func moveWindow(_ window: AXUIElement, toFrame frame: CGRect, constrainedTo bounds: CGRect? = nil) {
         let originalFrame = getWindowFrame(window)
 
         withEnhancedUserInterfaceDisabled(for: window) {
@@ -159,13 +159,16 @@ class WindowManager {
             // Grid 对齐 app（Ghostty / iTerm 等终端按字符尺寸对齐，部分 IDE 同理）
             // 会拒绝 setSize 到任意像素尺寸，size 改不动 → setPosition 的目标 y 又
             // 因实际 size 撑不下被边界 clamp，最后变成"贴边"而不是"居中"。
-            // 兜底策略：如果实际 size 跟 target 差 >5pt，就用实际 size 居中到 target frame 中心。
+            // 兜底策略：如果实际 size 跟 target 差 >5pt，就用实际 size 尽量居中到
+            // target frame；Snap Bar 传入屏幕可见区域时，避免 Xcode 这类最小尺寸较大的
+            // 窗口为了居中而越出屏幕边缘。
             if let actual = getWindowFrame(window) {
                 let sizeDiff = max(abs(actual.width - frame.width), abs(actual.height - frame.height))
                 if sizeDiff > 5 {
-                    let centeredOrigin = CGPoint(
-                        x: frame.midX - actual.width / 2,
-                        y: frame.midY - actual.height / 2
+                    let centeredOrigin = Self.fallbackOrigin(
+                        actualSize: actual.size,
+                        targetFrame: frame,
+                        bounds: bounds
                     )
                     if abs(centeredOrigin.x - actual.origin.x) > 1 || abs(centeredOrigin.y - actual.origin.y) > 1 {
                         moveWindow(window, to: centeredOrigin)
@@ -192,6 +195,29 @@ class WindowManager {
                 )
             }
         }
+    }
+
+    static func fallbackOrigin(actualSize: CGSize, targetFrame: CGRect, bounds: CGRect?) -> CGPoint {
+        let centered = CGPoint(
+            x: targetFrame.midX - actualSize.width / 2,
+            y: targetFrame.midY - actualSize.height / 2
+        )
+        guard let bounds else { return centered }
+        return CGPoint(
+            x: clampedOrigin(centered.x, length: actualSize.width, lowerBound: bounds.minX, upperBound: bounds.maxX),
+            y: clampedOrigin(centered.y, length: actualSize.height, lowerBound: bounds.minY, upperBound: bounds.maxY)
+        )
+    }
+
+    private static func clampedOrigin(
+        _ origin: CGFloat,
+        length: CGFloat,
+        lowerBound: CGFloat,
+        upperBound: CGFloat
+    ) -> CGFloat {
+        let maxOrigin = upperBound - length
+        guard maxOrigin > lowerBound else { return lowerBound }
+        return Swift.min(Swift.max(origin, lowerBound), maxOrigin)
     }
 
     /// 一些 app（Office、部分自渲染 app、终端等）会注入 enhanced UI 包装层，

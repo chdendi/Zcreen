@@ -1,4 +1,5 @@
 import Foundation
+import ApplicationServices
 import CoreGraphics
 
 struct WindowMatchCandidate {
@@ -28,10 +29,59 @@ struct WindowMatchAssignment {
     var isLowConfidence: Bool {
         score < 200
     }
+
+    /// Paired because the running window is the same AX element the saved entry was captured from.
+    var isIdentity: Bool {
+        score >= WindowMatcher.identityScore
+    }
 }
 
 enum WindowMatcher {
+    static let identityScore = 10_000
+
+    /// Pairs saved and running windows, trusting element identity before any heuristic.
+    ///
+    /// Display changes rarely restart apps, so a window still running since it was saved
+    /// is the same AX element. That pairing survives title changes and macOS moving or
+    /// shrinking the window, which is exactly when the heuristics below are least reliable.
+    /// `savedElements` is aligned with `saved`; `runningElements` with `running`.
+    static func match(saved: [WindowSnapshot], running: [WindowMatchCandidate],
+                      savedElements: [AXUIElement?], runningElements: [AXUIElement]) -> [WindowMatchAssignment] {
+        var assignments: [WindowMatchAssignment] = []
+        var usedSaved = Set<Int>()
+        var usedRunning = Set<Int>()
+
+        for (savedIndex, element) in savedElements.enumerated() where savedIndex < saved.count {
+            guard let element,
+                  let runningIndex = runningElements.indices.first(where: { index in
+                      index < running.count && !usedRunning.contains(index) && CFEqual(runningElements[index], element)
+                  })
+            else { continue }
+            assignments.append(WindowMatchAssignment(savedIndex: savedIndex, runningIndex: runningIndex, score: identityScore))
+            usedSaved.insert(savedIndex)
+            usedRunning.insert(runningIndex)
+        }
+
+        let remainingSaved = saved.indices.filter { !usedSaved.contains($0) }
+        let remainingRunning = running.indices.filter { !usedRunning.contains($0) }
+        // Strictness follows the full group: identity pairing must not turn an ambiguous
+        // leftover into a "only candidate" match.
+        let heuristic = match(saved: remainingSaved.map { saved[$0] }, running: remainingRunning.map { running[$0] },
+                              allowLowConfidence: saved.count <= 1 && running.count <= 1)
+        assignments += heuristic.map {
+            WindowMatchAssignment(savedIndex: remainingSaved[$0.savedIndex],
+                                  runningIndex: remainingRunning[$0.runningIndex],
+                                  score: $0.score)
+        }
+        return assignments
+    }
+
     static func match(saved: [WindowSnapshot], running: [WindowMatchCandidate]) -> [WindowMatchAssignment] {
+        match(saved: saved, running: running, allowLowConfidence: saved.count <= 1 && running.count <= 1)
+    }
+
+    private static func match(saved: [WindowSnapshot], running: [WindowMatchCandidate],
+                              allowLowConfidence: Bool) -> [WindowMatchAssignment] {
         // Compute every (saved, running) pair once, then greedily pick best-score pairs while
         // skipping already-claimed indices and ambiguous weak matches.
         // O(N² log N) instead of repeatedly scanning for the maximum in O(N³).
@@ -56,7 +106,7 @@ enum WindowMatcher {
             // Weak unnamed-window matches remain useful, but contradictory evidence
             // must not force a new document into an unrelated saved window's slot.
             if pair.score <= 0 { break }
-            if pair.isLowConfidence && (saved.count > 1 || running.count > 1) { continue }
+            if pair.isLowConfidence && !allowLowConfidence { continue }
             if usedSaved.contains(pair.savedIndex) || usedRunning.contains(pair.runningIndex) { continue }
             assignments.append(pair)
             usedSaved.insert(pair.savedIndex)
@@ -95,14 +145,12 @@ enum WindowMatcher {
         }
 
         // screenKey is the strongest screen signal — it is the persistent display ID, so a match
-        // strongly suggests "same physical monitor". Penalize a known mismatch to avoid placing a
-        // window on the wrong display when the user has multiple displays of the same model.
-        if let savedKey = saved.screenKey, let runningKey = running.screenKey {
-            if savedKey == runningKey {
-                score += 180
-            } else {
-                score -= 100
-            }
+        // strongly suggests "same physical monitor" and separates same-titled windows on
+        // displays of the same model. A mismatch is deliberately not penalized: after a display
+        // change the running window's screen is wherever macOS evicted it to, so a penalty
+        // would mostly push correct pairings below the confidence threshold.
+        if let savedKey = saved.screenKey, let runningKey = running.screenKey, savedKey == runningKey {
+            score += 180
         }
 
         if saved.screenName == running.screenName {

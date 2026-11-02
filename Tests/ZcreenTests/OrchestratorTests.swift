@@ -12,8 +12,8 @@ final class OrchestratorTests: XCTestCase {
             configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()),
             snapshotStore: store, scheduler: scheduler, powerMonitor: power)
         orchestrator.autoApplyOnScreenChange = false
-        store.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "main", profileLabel: "Main", titles: ["Current"])
         power.simulateScreenLocked(true)
+        store.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "main", profileLabel: "Main", titles: ["Current"])
         power.simulateScreenLocked(false)
         orchestrator.performPeriodicAutoSaveForTesting()
         XCTAssertEqual(store.saveCallCount, 0)
@@ -59,6 +59,207 @@ final class OrchestratorTests: XCTestCase {
         scheduler.runAll()
         XCTAssertEqual(manager.moveToScreenCallCount, 0)
         XCTAssertEqual(scheduler.delays.count, 1, "Cancellation must also stop further polling")
+    }
+
+    // MARK: - Wake / suspend
+
+    func testSuspendSavesTheLayoutBeforeSavesAreGated() {
+        let detector = makeScreenDetector(screen: makeScreen(), profileKey: "main", profileLabel: "Main")
+        let store = TestSnapshotStore()
+        let power = PowerStateMonitor(observe: false)
+        let orchestrator = makeOrchestrator(screenDetector: detector,
+            configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()),
+            snapshotStore: store, powerMonitor: power)
+        store.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "main", profileLabel: "Main", titles: ["Before lock"])
+
+        power.simulateScreenLocked(true)
+
+        XCTAssertEqual(store.saveCallCount, 1)
+        XCTAssertEqual(store.storedSnapshots["main"]?.windows.first?.windowTitle, "Before lock")
+        orchestrator.performPeriodicAutoSaveForTesting()
+        XCTAssertEqual(store.saveCallCount, 1)
+    }
+
+    func testUnlockWithoutDisplayEventsSkipsRestore() {
+        let detector = makeScreenDetector(screen: makeScreen(), profileKey: "stable", profileLabel: "Stable")
+        let store = TestSnapshotStore()
+        let scheduler = TestScheduler()
+        let power = PowerStateMonitor(observe: false)
+        store.storedSnapshots["stable"] = makeLayoutSnapshot(profileKey: "stable", profileLabel: "Stable", titles: ["W"])
+        let orchestrator = makeOrchestrator(screenDetector: detector,
+            configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()),
+            snapshotStore: store, scheduler: scheduler, powerMonitor: power)
+
+        power.simulateScreenLocked(true)
+        power.simulateScreenLocked(false)
+        scheduler.runAll()
+
+        XCTAssertEqual(store.restoreCallCount, 0, "Nothing moved the windows, so nothing should be restored")
+        store.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "stable", profileLabel: "Stable", titles: ["After"])
+        orchestrator.performPeriodicAutoSaveForTesting()
+        XCTAssertEqual(store.saveCallCount, 1, "Leaving the wake window must reopen saves")
+    }
+
+    func testDisplayEventDuringSuspendStillRestoresAfterWake() {
+        let detector = makeScreenDetector(screen: makeScreen(), profileKey: "stable", profileLabel: "Stable")
+        let store = TestSnapshotStore()
+        let scheduler = TestScheduler()
+        let power = PowerStateMonitor(observe: false)
+        store.storedSnapshots["stable"] = makeLayoutSnapshot(profileKey: "stable", profileLabel: "Stable", titles: ["W"])
+        let orchestrator = makeOrchestrator(screenDetector: detector,
+            configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()),
+            snapshotStore: store, scheduler: scheduler, powerMonitor: power)
+
+        power.simulateScreenLocked(true)
+        // A display dropped out and came back while asleep: macOS may have moved windows.
+        orchestrator.handleScreenWillChange()
+        orchestrator.routeScreenChange(newProfileKey: "stable")
+        power.simulateScreenLocked(false)
+        scheduler.runAll()
+
+        XCTAssertEqual(store.restoreCallCount, 1)
+    }
+
+    func testWakeCooldownRetriesARestoreInterruptedByABeginPulse() {
+        let detector = makeScreenDetector(screen: makeScreen(), profileKey: "stable", profileLabel: "Stable")
+        let store = TestSnapshotStore()
+        store.simulateInFlightRestore = true
+        let scheduler = TestScheduler()
+        let power = PowerStateMonitor(observe: false)
+        store.storedSnapshots["stable"] = makeLayoutSnapshot(profileKey: "stable", profileLabel: "Stable", titles: ["W"])
+        let orchestrator = makeOrchestrator(screenDetector: detector,
+            configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()),
+            snapshotStore: store, scheduler: scheduler, powerMonitor: power)
+
+        power.simulateScreenLocked(true)
+        power.simulateScreenLocked(false)
+        orchestrator.routeScreenChange(newProfileKey: "stable")
+        XCTAssertEqual(store.restoreCallCount, 1)
+
+        // An echo of the same profile cancels the restore while it is still retrying.
+        orchestrator.handleScreenWillChange()
+        orchestrator.routeScreenChange(newProfileKey: "stable")
+        XCTAssertEqual(store.restoreCallCount, 1, "The echo itself is absorbed")
+
+        scheduler.runAll()
+        XCTAssertEqual(store.restoreCallCount, 2, "The interrupted restore must run again before the window closes")
+
+        store.simulateInFlightRestore = false
+        store.finishInFlightRestore()
+        scheduler.runAll()
+        XCTAssertEqual(store.restoreCallCount, 2)
+    }
+
+    func testWakeCooldownRestoresAgainWhenSameDisplaysChangeGeometry() {
+        let screen = makeScreen(frame: CGRect(x: 0, y: 0, width: 1512, height: 982))
+        let detector = makeScreenDetector(screen: screen, profileKey: "stable", profileLabel: "Stable")
+        let store = TestSnapshotStore()
+        let scheduler = TestScheduler()
+        let power = PowerStateMonitor(observe: false)
+        store.storedSnapshots["stable"] = makeLayoutSnapshot(profileKey: "stable", profileLabel: "Stable", titles: ["W"])
+        let orchestrator = makeOrchestrator(screenDetector: detector,
+            configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()),
+            snapshotStore: store, scheduler: scheduler, powerMonitor: power)
+
+        power.simulateScreenLocked(true)
+        power.simulateScreenLocked(false)
+        orchestrator.routeScreenChange(newProfileKey: "stable")
+        XCTAssertEqual(store.restoreCallCount, 1)
+
+        // Same display (same profile key) settles on a different resolution mid-cooldown.
+        detector.setStateForTesting(screens: [makeScreen(frame: CGRect(x: 0, y: 0, width: 1800, height: 1169))],
+                                    profileKey: "stable", profileLabel: "Stable")
+        orchestrator.routeScreenChange(newProfileKey: "stable")
+        XCTAssertEqual(store.restoreCallCount, 1)
+
+        scheduler.runAll()
+        XCTAssertEqual(store.restoreCallCount, 2, "Restoring against the old geometry must be redone")
+    }
+
+    func testWakeWithAnUnfamiliarDisplayUsesTheShortTimeout() {
+        let detector = makeScreenDetector(screen: makeScreen(), profileKey: "builtin+office", profileLabel: "Office")
+        let scheduler = TestScheduler()
+        let power = PowerStateMonitor(observe: false)
+        let orchestrator = makeOrchestrator(screenDetector: detector,
+            configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()),
+            snapshotStore: TestSnapshotStore(), scheduler: scheduler, powerMonitor: power)
+
+        orchestrator.enterWakeSettleWindow()
+        orchestrator.routeScreenChange(newProfileKey: "builtin")
+        XCTAssertEqual(scheduler.delays.last, Constants.Timing.wakeSettleDelay, "A missing display may still come back")
+        orchestrator.routeScreenChange(newProfileKey: "builtin+home")
+        XCTAssertEqual(scheduler.delays.last, Constants.Timing.wakeSettleForeignDisplayDelay)
+    }
+
+    // MARK: - Saves
+
+    func testScreenWillChangeDiscardsCaptureWhenDisplaysAlreadyChanged() {
+        let screen = makeScreen()
+        let detector = ScreenDetector(shouldRegisterCallback: false)
+        detector.setStateForTesting(screens: [screen], profileKey: "main", profileLabel: "Main",
+                                    liveGeometry: [.init(displayID: 99, frame: CGRect(x: 0, y: 0, width: 800, height: 600))])
+        let store = TestSnapshotStore()
+        store.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "main", profileLabel: "Main", titles: ["Half moved"])
+        let orchestrator = makeOrchestrator(screenDetector: detector,
+            configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()), snapshotStore: store)
+
+        orchestrator.handleScreenWillChange()
+
+        XCTAssertEqual(store.saveCallCount, 0)
+    }
+
+    func testPeriodicTickSkipsTheSweepWithoutUserInput() {
+        let detector = makeScreenDetector(screen: makeScreen(), profileKey: "main", profileLabel: "Main")
+        let store = TestSnapshotStore()
+        let clock = TestClock()
+        var idleSeconds: TimeInterval = 0
+        let orchestrator = makeOrchestrator(screenDetector: detector,
+            configManager: ConfigManager(loadFromDisk: false, configDirectory: tempDirectory()),
+            snapshotStore: store, now: { clock.now }, secondsSinceLastUserInput: { idleSeconds })
+        store.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "main", profileLabel: "Main", titles: ["First"])
+        orchestrator.performPeriodicTickForTesting()
+        XCTAssertEqual(store.saveCallCount, 1)
+
+        clock.advance(by: 15)
+        idleSeconds = 20
+        store.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "main", profileLabel: "Main", titles: ["Second"])
+        orchestrator.performPeriodicTickForTesting()
+        XCTAssertEqual(store.saveCallCount, 1, "No input since the last capture: skip the AX sweep")
+
+        clock.advance(by: 15)
+        idleSeconds = 3
+        orchestrator.performPeriodicTickForTesting()
+        XCTAssertEqual(store.saveCallCount, 2)
+    }
+
+    func testStuckReconfigurationFlagIsClearedAndDeferredLaunchReplayed() {
+        let detector = makeScreenDetector(screen: makeScreen(), profileKey: "main", profileLabel: "Main")
+        let config = ConfigManager(loadFromDisk: false, configDirectory: tempDirectory())
+        config.setStateForTesting(configuration: Configuration(version: 1, debounceMs: nil,
+            screens: [ScreenAlias(alias: "main", nameContains: "Built-in")],
+            rules: [Rule(app: AppMatcher(bundleId: "com.test.app", nameContains: nil),
+                         targetScreen: "main", profileOverrides: nil)], profiles: nil, windowFilter: nil))
+        let manager = TestWindowManager()
+        manager.windowsByBundle["com.test.app"] = [makeWindowInfo(bundleId: "com.test.app", title: "New",
+            frame: CGRect(x: 9000, y: 50, width: 600, height: 400))]
+        let store = TestSnapshotStore()
+        let clock = TestClock()
+        let orchestrator = makeOrchestrator(screenDetector: detector, configManager: config,
+            windowManager: manager, snapshotStore: store, now: { clock.now })
+
+        orchestrator.handleScreenWillChange()
+        orchestrator.handleAppLaunch(bundleId: "com.test.app", appName: "Test")
+        XCTAssertEqual(manager.moveToScreenCallCount, 0, "Launch rules wait while displays change")
+
+        clock.advance(by: Constants.Timing.reconfigWatchdogDelay - 1)
+        orchestrator.performPeriodicAutoSaveForTesting()
+        XCTAssertEqual(manager.moveToScreenCallCount, 0)
+
+        clock.advance(by: 2)
+        store.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "main", profileLabel: "Main", titles: ["Now"])
+        orchestrator.performPeriodicAutoSaveForTesting()
+        XCTAssertEqual(manager.moveToScreenCallCount, 1, "The deferred launch rule runs once the flag clears")
+        XCTAssertEqual(store.saveCallCount, 1)
     }
 
     func testMissingProfileSwitchAndLockCancelPendingRestore() {
@@ -506,7 +707,6 @@ final class OrchestratorTests: XCTestCase {
         let detector = makeScreenDetector(screen: makeScreen(), profileKey: "main-profile", profileLabel: "Main")
         let snapshotStore = TestSnapshotStore()
         let powerMonitor = PowerStateMonitor(observe: false)
-        snapshotStore.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "main-profile", profileLabel: "Main", titles: ["Mangled"])
 
         let orchestrator = makeOrchestrator(
             screenDetector: detector,
@@ -516,6 +716,7 @@ final class OrchestratorTests: XCTestCase {
         )
 
         powerMonitor.simulateScreenLocked(true)
+        snapshotStore.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "main-profile", profileLabel: "Main", titles: ["Mangled"])
         orchestrator.performPeriodicAutoSaveForTesting()
 
         XCTAssertEqual(snapshotStore.saveCallCount, 0, "Locked/suspended state must not persist snapshots")
@@ -527,7 +728,7 @@ final class OrchestratorTests: XCTestCase {
         let scheduler = TestScheduler()
         let powerMonitor = PowerStateMonitor(observe: false)
         snapshotStore.storedSnapshots["stable"] = makeLayoutSnapshot(profileKey: "stable", profileLabel: "Stable", titles: ["W"])
-        snapshotStore.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "stable", profileLabel: "Stable", titles: ["Changed"])
+        snapshotStore.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "stable", profileLabel: "Stable", titles: ["W"])
 
         let orchestrator = makeOrchestrator(
             screenDetector: detector,
@@ -538,6 +739,7 @@ final class OrchestratorTests: XCTestCase {
         )
 
         powerMonitor.simulateScreenLocked(true)
+        snapshotStore.nextCapturedSnapshot = makeLayoutSnapshot(profileKey: "stable", profileLabel: "Stable", titles: ["Changed"])
         powerMonitor.simulateScreenLocked(false)
 
         // Inside the wake-settle window: all auto-save triggers are absorbed.
@@ -719,7 +921,9 @@ final class OrchestratorTests: XCTestCase {
         snapshotStore: LayoutSnapshotStore,
         scheduler: TestScheduler? = nil,
         settingsStore: MenuSettingsStore? = nil,
-        powerMonitor: PowerStateMonitor = PowerStateMonitor(observe: false)
+        powerMonitor: PowerStateMonitor = PowerStateMonitor(observe: false),
+        now: @escaping () -> Date = Date.init,
+        secondsSinceLastUserInput: @escaping () -> TimeInterval = { 0 }
     ) -> Orchestrator {
         let runLoopScheduler = scheduler ?? TestScheduler()
         let resolvedSettingsStore = settingsStore ?? MenuSettingsStore(defaults: temporaryUserDefaults())
@@ -738,7 +942,9 @@ final class OrchestratorTests: XCTestCase {
             },
             powerMonitor: powerMonitor,
             enableAppLaunchObserver: false,
-            enableAutoSaveTimer: false
+            enableAutoSaveTimer: false,
+            now: now,
+            secondsSinceLastUserInput: secondsSinceLastUserInput
         )
     }
 
@@ -825,8 +1031,16 @@ private final class TestScheduler {
     }
 }
 
+private final class TestClock {
+    private(set) var now = Date(timeIntervalSince1970: 2_000_000)
+    func advance(by interval: TimeInterval) { now = now.addingTimeInterval(interval) }
+}
+
 private final class TestSnapshotStore: LayoutSnapshotStore {
     var nextCapturedSnapshot = LayoutSnapshot(profileKey: "", profileLabel: "", timestamp: Date(), windows: [])
+    /// When set, each restore stays "in flight" (retrying) until cancelled or finished.
+    var simulateInFlightRestore = false
+    private var restoreInFlight = false
     var storedSnapshots: [String: LayoutSnapshot] = [:]
     private(set) var lastExcludeAppMatchers: [AppMatcher] = []
     private(set) var saveCallCount = 0
@@ -847,22 +1061,29 @@ private final class TestSnapshotStore: LayoutSnapshotStore {
         storedSnapshots[profileKey]
     }
 
-    override func cancelRestore() {
+    override var isRestoreInFlight: Bool { restoreInFlight }
+
+    func finishInFlightRestore() { restoreInFlight = false }
+
+    override func cancelRestore() -> Bool {
         cancelRestoreCallCount += 1
-        super.cancelRestore()
+        let wasInFlight = restoreInFlight
+        restoreInFlight = false
+        return super.cancelRestore() || wasInFlight
     }
 
-    override func captureSnapshot(profileKey: String, profileLabel: String, windowManager: WindowManager,
-                                  screens: [ScreenInfo], excludeAppMatchers: [AppMatcher],
-                                  windowFilter: WindowFilter) -> LayoutSnapshot {
-        nextCapturedSnapshot
+    override func captureLayout(profileKey: String, profileLabel: String, windowManager: WindowManager,
+                                screens: [ScreenInfo], excludeAppMatchers: [AppMatcher],
+                                windowFilter: WindowFilter) -> CapturedLayout {
+        CapturedLayout(snapshot: nextCapturedSnapshot, elements: [])
     }
 
     override func restoreSnapshot(_ snapshot: LayoutSnapshot, windowManager: WindowManager,
-                                  excludeBundleIds: Set<String>, excludeAppMatchers: [AppMatcher],
-                                  windowFilter: WindowFilter) {
+                                  excludeAppMatchers: [AppMatcher], windowFilter: WindowFilter,
+                                  completion: ((RestoreOutcome) -> Void)?) {
         lastExcludeAppMatchers = excludeAppMatchers
         restoreCallCount += 1
+        restoreInFlight = simulateInFlightRestore
     }
 }
 
@@ -877,6 +1098,10 @@ private final class TestWindowManager: WindowManager {
 
     override func getWindows(bundleId: String) -> [WindowInfo] {
         windowsByBundle[bundleId] ?? []
+    }
+
+    override func getWindows(bundleIds: Set<String>) -> [WindowInfo] {
+        bundleIds.flatMap { windowsByBundle[$0] ?? [] }
     }
 
     override func moveWindowToScreen(_ window: AXUIElement, currentFrame: CGRect, targetScreen: ScreenInfo) {

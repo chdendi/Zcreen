@@ -1,4 +1,5 @@
 import XCTest
+import ApplicationServices
 @testable import Zcreen
 
 final class SnapshotServiceTests: XCTestCase {
@@ -130,6 +131,132 @@ final class SnapshotServiceTests: XCTestCase {
         XCTAssertEqual(fixture.store.storedSnapshots["main"]?.windows, [ghostty])
     }
 
+    // MARK: - Restore guard
+
+    func testUnplacedWindowCannotOverwriteSavedSlotUntilTheUserMovesIt() {
+        let fixture = makeFixture()
+        let savedLeft = makeWindow(bundleId: "com.test.a", title: "Left", x: 10)
+        fixture.store.storedSnapshots["main"] = makeSnapshot(windows: [savedLeft])
+        let orphan = AXUIElementCreateApplication(900)
+        let evicted = CGRect(x: 300, y: 30, width: 600, height: 400)
+        fixture.store.restoreOutcome = RestoreOutcome(
+            profileKey: "main", placedCount: 0, drifted: [],
+            orphans: [.init(window: orphan, bundleId: "com.test.a", frame: evicted)],
+            unresolved: [savedLeft]
+        )
+        _ = fixture.service.restoreLayout(profileKey: "main", profileLabel: "Main")
+
+        // macOS left the window where it evicted it; the save must keep the saved slot.
+        capture(fixture, [(makeWindow(bundleId: "com.test.a", title: "Untitled", x: 300), orphan)])
+        guard case .unchanged = fixture.service.saveCurrentLayout(trigger: .screenChange, force: false) else {
+            return XCTFail("An untouched unplaced window must not replace its saved slot")
+        }
+        XCTAssertEqual(fixture.store.storedSnapshots["main"]?.windows, [savedLeft])
+
+        // Once the user moves it, its new position is saved.
+        let moved = makeWindow(bundleId: "com.test.a", title: "Untitled", x: 700)
+        capture(fixture, [(moved, orphan)])
+        _ = fixture.service.saveCurrentLayout(trigger: .periodic, force: false)
+        XCTAssertTrue(fixture.store.storedSnapshots["main"]?.windows.contains(moved) == true)
+
+        // After the guard lifetime the regular merge takes over again.
+        fixture.clock.advance(by: Constants.Timing.restoreGuardLifetime + 1)
+        _ = fixture.service.saveCurrentLayout(trigger: .periodic, force: false)
+        XCTAssertEqual(fixture.store.storedSnapshots["main"]?.windows, [moved])
+    }
+
+    func testDriftedWindowKeepsItsSavedEntryUntilMoved() {
+        let fixture = makeFixture()
+        let savedRight = makeWindow(bundleId: "com.test.a", title: "Right", x: 900)
+        let other = makeWindow(bundleId: "com.test.b", title: "B", x: 10)
+        fixture.store.storedSnapshots["main"] = makeSnapshot(windows: [savedRight, other])
+        let element = AXUIElementCreateApplication(901)
+        fixture.store.restoreOutcome = RestoreOutcome(
+            profileKey: "main", placedCount: 1,
+            drifted: [.init(window: element, saved: savedRight, frame: CGRect(x: 400, y: 30, width: 600, height: 400))],
+            orphans: [], unresolved: []
+        )
+        _ = fixture.service.restoreLayout(profileKey: "main", profileLabel: "Main")
+
+        capture(fixture, [(makeWindow(bundleId: "com.test.a", title: "Right", x: 400), element), (other, nil)])
+        _ = fixture.service.saveCurrentLayout(trigger: .periodic, force: false)
+        XCTAssertEqual(fixture.store.storedSnapshots["main"]?.windows, [savedRight, other])
+
+        let moved = makeWindow(bundleId: "com.test.a", title: "Right", x: 1200)
+        capture(fixture, [(moved, element), (other, nil)])
+        _ = fixture.service.saveCurrentLayout(trigger: .periodic, force: false)
+        XCTAssertEqual(fixture.store.storedSnapshots["main"]?.windows, makeSnapshot(windows: [moved, other]).windows)
+    }
+
+    func testManualSaveDropsTheRestoreGuard() {
+        let fixture = makeFixture()
+        let savedLeft = makeWindow(bundleId: "com.test.a", title: "Left", x: 10)
+        fixture.store.storedSnapshots["main"] = makeSnapshot(windows: [savedLeft])
+        let orphan = AXUIElementCreateApplication(902)
+        fixture.store.restoreOutcome = RestoreOutcome(
+            profileKey: "main", placedCount: 0, drifted: [],
+            orphans: [.init(window: orphan, bundleId: "com.test.a", frame: CGRect(x: 300, y: 30, width: 600, height: 400))],
+            unresolved: [savedLeft]
+        )
+        _ = fixture.service.restoreLayout(profileKey: "main", profileLabel: "Main")
+
+        let current = makeWindow(bundleId: "com.test.a", title: "Untitled", x: 300)
+        capture(fixture, [(current, orphan)])
+        _ = fixture.service.saveCurrentLayout(trigger: .manual, force: true)
+        XCTAssertEqual(fixture.store.storedSnapshots["main"]?.windows, [current])
+    }
+
+    func testCompleteRestoreInstallsNoGuard() {
+        let fixture = makeFixture()
+        let saved = makeWindow(bundleId: "com.test.a", title: "A", x: 10)
+        fixture.store.storedSnapshots["main"] = makeSnapshot(windows: [saved])
+        fixture.store.restoreOutcome = RestoreOutcome(profileKey: "main", placedCount: 1, drifted: [], orphans: [], unresolved: [])
+        _ = fixture.service.restoreLayout(profileKey: "main", profileLabel: "Main")
+
+        let moved = makeWindow(bundleId: "com.test.a", title: "A", x: 500)
+        capture(fixture, [(moved, AXUIElementCreateApplication(903))])
+        _ = fixture.service.saveCurrentLayout(trigger: .periodic, force: false)
+        XCTAssertEqual(fixture.store.storedSnapshots["main"]?.windows, [moved])
+    }
+
+    func testCaptureIsDiscardedWhenValidationFails() {
+        let fixture = makeFixture()
+        fixture.store.nextCapturedSnapshot = makeSnapshot(windows: [makeWindow(bundleId: "a", title: "A", x: 10)])
+        guard case .discarded = fixture.service.saveCurrentLayout(trigger: .screenWillChange, force: false,
+                                                                    validate: { false }) else {
+            return XCTFail("A capture that raced a display change must be discarded")
+        }
+        XCTAssertEqual(fixture.store.saveCallCount, 0)
+    }
+
+    func testAutomaticSaveWaitsForInFlightRestore() {
+        let fixture = makeFixture()
+        fixture.store.inFlight = true
+        fixture.store.nextCapturedSnapshot = makeSnapshot(windows: [makeWindow(bundleId: "a", title: "A", x: 10)])
+        guard case .deferred = fixture.service.saveCurrentLayout(trigger: .periodic, force: false) else {
+            return XCTFail("Automatic saves must not capture windows mid-restore")
+        }
+        guard case .saved = fixture.service.saveCurrentLayout(trigger: .manual, force: true) else {
+            return XCTFail("A manual save still goes through")
+        }
+    }
+
+    func testSaveRemembersWindowIdentities() {
+        let fixture = makeFixture()
+        let window = makeWindow(bundleId: "a", title: "A", x: 10)
+        let element = AXUIElementCreateApplication(904)
+        capture(fixture, [(window, element)])
+        _ = fixture.service.saveCurrentLayout(trigger: .periodic, force: false)
+        let known = fixture.store.identityElements(for: [window], profileKey: "main")
+        XCTAssertTrue(known.first.flatMap { $0 }.map { CFEqual($0, element) } == true)
+    }
+
+    private func capture(_ fixture: Fixture, _ windows: [(WindowSnapshot, AXUIElement?)]) {
+        let sorted = windows.sorted { LayoutSnapshotStore.compareWindowSnapshots($0.0, $1.0) }
+        fixture.store.nextCapturedSnapshot = makeSnapshot(windows: sorted.map(\.0))
+        fixture.store.nextCapturedElements = sorted.map(\.1)
+    }
+
     // MARK: - Fixture
 
     private func configurationExcludingAppB() -> Configuration {
@@ -141,6 +268,7 @@ final class SnapshotServiceTests: XCTestCase {
     private struct Fixture {
         let service: SnapshotService
         let store: StubSnapshotStore
+        let clock: TestClock
     }
 
     private func makeFixture(configuration: Configuration = .empty) -> Fixture {
@@ -165,13 +293,15 @@ final class SnapshotServiceTests: XCTestCase {
             configDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         )
         configManager.setStateForTesting(configuration: configuration)
+        let clock = TestClock()
         let service = SnapshotService(
             screenSession: ScreenSessionService(screenDetector: detector),
             configManager: configManager,
             windowManager: WindowManager(),
-            snapshotStore: store
+            snapshotStore: store,
+            now: { clock.now }
         )
-        return Fixture(service: service, store: store)
+        return Fixture(service: service, store: store, clock: clock)
     }
 
     private func makeSnapshot(windows: [WindowSnapshot]) -> LayoutSnapshot {
@@ -198,9 +328,25 @@ final class SnapshotServiceTests: XCTestCase {
     }
 }
 
+private final class TestClock {
+    private(set) var now = Date(timeIntervalSince1970: 2_000_000)
+    func advance(by interval: TimeInterval) { now = now.addingTimeInterval(interval) }
+}
+
 private final class StubSnapshotStore: LayoutSnapshotStore {
     var shouldSave = true
+    var inFlight = false
+    var restoreOutcome: RestoreOutcome?
     var nextCapturedSnapshot = LayoutSnapshot(profileKey: "", profileLabel: "", timestamp: Date(), windows: [])
+    var nextCapturedElements: [AXUIElement?] = []
+
+    override var isRestoreInFlight: Bool { inFlight }
+
+    override func restoreSnapshot(_ snapshot: LayoutSnapshot, windowManager: WindowManager,
+                                  excludeAppMatchers: [AppMatcher], windowFilter: WindowFilter,
+                                  completion: ((RestoreOutcome) -> Void)?) {
+        if let restoreOutcome { completion?(restoreOutcome) }
+    }
     var storedSnapshots: [String: LayoutSnapshot] = [:]
     private(set) var lastExcludeAppMatchers: [AppMatcher] = []
     private(set) var saveCallCount = 0
@@ -223,10 +369,10 @@ private final class StubSnapshotStore: LayoutSnapshotStore {
         storedSnapshots[profileKey]
     }
 
-    override func captureSnapshot(profileKey: String, profileLabel: String, windowManager: WindowManager,
-                                  screens: [ScreenInfo], excludeAppMatchers: [AppMatcher],
-                                  windowFilter: WindowFilter) -> LayoutSnapshot {
+    override func captureLayout(profileKey: String, profileLabel: String, windowManager: WindowManager,
+                                screens: [ScreenInfo], excludeAppMatchers: [AppMatcher],
+                                windowFilter: WindowFilter) -> CapturedLayout {
         lastExcludeAppMatchers = excludeAppMatchers
-        return nextCapturedSnapshot
+        return CapturedLayout(snapshot: nextCapturedSnapshot, elements: nextCapturedElements)
     }
 }

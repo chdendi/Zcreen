@@ -21,11 +21,20 @@ final class Orchestrator: ObservableObject {
     private let isAccessibilityTrusted: () -> Bool
     private let requestAccessibilityAccess: () -> Void
     private let scheduleAfter: (TimeInterval, @escaping () -> Void) -> Void
+    private let now: () -> Date
+    private let secondsSinceLastUserInput: () -> TimeInterval
 
     private var cancellables = Set<AnyCancellable>()
     private var autoSaveTimer: Timer?
-    private var isScreenReconfiguring = false
     private var screenSaveGeneration: UInt64 = 0
+    private var isScreenReconfiguring = false
+    /// Last begin / completion event, used by the watchdog that unsticks `isScreenReconfiguring`.
+    private var lastReconfigActivityAt: Date?
+    /// When a capture last ran. The periodic save skips its AX sweep if the user has not
+    /// touched mouse or keyboard since then.
+    private var lastLayoutCaptureAt: Date?
+    /// Launch rules that arrived while displays were changing; replayed once they settle.
+    private var deferredAppLaunches: [(bundleId: String?, appName: String?)] = []
 
     // MARK: - Wake-settle state machine
     //
@@ -35,16 +44,16 @@ final class Orchestrator: ObservableObject {
     //   awaitingFirstRestore — no restore yet. Each reconfig event re-arms the
     //     debounce timer; if a profile matching `wakeSettleExpectedKey`
     //     (= the pre-suspend profile) shows up, restore immediately. Otherwise we
-    //     wait at most `wakeSettleDelay` of silence before doing a best-effort
-    //     restore against whatever the detector currently reports.
+    //     wait at most `wakeSettleDelay` of silence (shorter when a display that was
+    //     not connected before suspend appears) before a best-effort restore against
+    //     whatever the detector currently reports. If no display event happened at all
+    //     and the topology is unchanged, macOS never moved anything: skip the restore.
     //
-    //   awaitingExit (cooldown) — first restore has fired. Reconfig events that
-    //     match the last restored profile are absorbed (re-arm cooldown only).
-    //     Events that drift back to expected re-trigger restore. Other transients
-    //     are absorbed too — we don't chase every flicker macOS emits while it's
-    //     still negotiating modes on external displays.
-    //
-    // The window exits after `wakeSettleCooldownDelay` of silence post-restore.
+    //   awaitingExit (cooldown) — first restore has fired. Reconfig events are absorbed
+    //     (re-arm cooldown only) unless the profile drifts back to expected. When the
+    //     cooldown elapses we restore once more if the profile or the display geometry
+    //     changed since the last restore, or if a begin pulse interrupted that restore
+    //     before it finished; otherwise the window closes.
     private enum WakeSettleStage {
         case awaitingFirstRestore
         case awaitingExit
@@ -58,10 +67,15 @@ final class Orchestrator: ObservableObject {
     /// Profile key from before the suspend cycle, used as the heuristic target —
     /// matching it short-circuits the debounce wait.
     private var wakeSettleExpectedKey: String = ""
-    /// Last profile we restored to inside this wake-settle window. Used in
-    /// cooldown to decide whether a new event is just a duplicate echo or a
-    /// genuine drift that warrants another restore.
+    /// Last profile / geometry we restored to inside this wake-settle window.
     private var wakeSettleLastRestoredKey: String = ""
+    private var wakeSettleLastRestoredFingerprint: String = ""
+    /// A begin pulse cancelled the cooldown restore (or its rule retries) before it finished.
+    private var wakeSettleRestoreInterrupted = false
+    /// Display state captured when the system suspended.
+    private var suspendProfileKey: String?
+    private var suspendFingerprint: String?
+    private var sawDisplayEventSinceSuspend = false
 
     var autoApplyOnScreenChange: Bool {
         get { menuState.autoApplyOnScreenChange }
@@ -90,7 +104,15 @@ final class Orchestrator: ObservableObject {
         },
         powerMonitor: PowerStateMonitor = PowerStateMonitor(),
         enableAppLaunchObserver: Bool = true,
-        enableAutoSaveTimer: Bool = true
+        enableAutoSaveTimer: Bool = true,
+        now: @escaping () -> Date = Date.init,
+        secondsSinceLastUserInput: @escaping () -> TimeInterval = {
+            // kCGAnyInputEventType: any HID or posted input event. Needs no extra permission.
+            // If the type cannot be formed, report fresh input so the periodic save still runs.
+            CGEventType(rawValue: UInt32.max).map {
+                CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: $0)
+            } ?? 0
+        }
     ) {
         self.screenDetector = screenDetector
         self.configManager = configManager
@@ -117,7 +139,8 @@ final class Orchestrator: ObservableObject {
             screenSession: resolvedScreenSessionService,
             configManager: configManager,
             windowManager: windowManager,
-            snapshotStore: snapshotStore
+            snapshotStore: snapshotStore,
+            now: now
         )
         self.ruleApplyService = RuleApplyService(
             screenSession: resolvedScreenSessionService,
@@ -132,6 +155,8 @@ final class Orchestrator: ObservableObject {
         self.requestAccessibilityAccess = requestAccessibilityAccess
         self.scheduleAfter = scheduleAfter
         self.powerMonitor = powerMonitor
+        self.now = now
+        self.secondsSinceLastUserInput = secondsSinceLastUserInput
 
         resolvedSnapBarController.onSnap = { [weak self] in
             self?.autoSaveCurrentLayout(trigger: .snapBar)
@@ -177,8 +202,7 @@ final class Orchestrator: ObservableObject {
             return
         }
 
-        let result = snapshotService.saveCurrentLayout(trigger: .manual, force: true)
-        if let statusMessage = result.statusMessage {
+        if let statusMessage = captureLayout(trigger: .manual, force: true)?.statusMessage {
             lastAction = statusMessage
         }
     }
@@ -200,8 +224,8 @@ final class Orchestrator: ObservableObject {
                     self.routeScreenChange(newProfileKey: newProfileKey)
                 } else {
                     self.snapshotStore.cancelRestore()
-                    self.ruleApplyService.cancelPendingLaunches()
-                    self.isScreenReconfiguring = true
+                    self.ruleApplyService.cancelPendingWork()
+                    self.markScreenReconfiguring()
                     self.screenSaveGeneration &+= 1
                     _ = self.screenSessionService.recordScreenChange(to: newProfileKey)
                     self.scheduleDelayedAutoSave(trigger: .screenChange, delay: Constants.Timing.screenChangeAutoSaveDelay)
@@ -226,7 +250,7 @@ final class Orchestrator: ObservableObject {
                 if self.menuState.autoApplyOnScreenChange {
                     self.enterWakeSettleWindow()
                 } else {
-                    self.isScreenReconfiguring = true
+                    self.markScreenReconfiguring()
                     self.screenSaveGeneration &+= 1
                     let key = self.screenDetector.refreshScreens()
                     _ = self.screenSessionService.recordScreenChange(to: key)
@@ -238,15 +262,27 @@ final class Orchestrator: ObservableObject {
         powerMonitor.onSuspendedChanged
             .filter { $0 }
             .sink { [weak self] _ in
-                guard let self else { return }
-                self.snapshotStore.cancelRestore()
-                self.ruleApplyService.cancelPendingLaunches()
-                self.wakeSettleGeneration &+= 1
-                self.screenSaveGeneration &+= 1
-                self.isInWakeSettleWindow = false
-                self.isScreenReconfiguring = false
+                self?.handleSuspend()
             }
             .store(in: &cancellables)
+    }
+
+    private func handleSuspend() {
+        // Windows are still where the user left them. Persist them now: periodic saves
+        // stop while suspended, and the last one may be up to 15 seconds old.
+        if !isScreenReconfiguring, !isInWakeSettleWindow {
+            _ = captureLayout(trigger: .suspend, force: false)
+        }
+        suspendProfileKey = screenDetector.profileKey
+        suspendFingerprint = screenDetector.topologyFingerprint
+        sawDisplayEventSinceSuspend = false
+
+        snapshotStore.cancelRestore()
+        ruleApplyService.cancelPendingWork()
+        wakeSettleGeneration &+= 1
+        screenSaveGeneration &+= 1
+        isInWakeSettleWindow = false
+        isScreenReconfiguring = false
     }
 
     /// Top-level gate for screen reconfig events.
@@ -255,6 +291,7 @@ final class Orchestrator: ObservableObject {
     /// - In wake-settle window → hand off to the state machine below.
     /// - Otherwise → run inline (historical behavior).
     func routeScreenChange(newProfileKey: String) {
+        noteDisplayEventIfSettling()
         if powerMonitor.isSuspended {
             Log.screen.info("Screen change ignored: system suspended (profile=\(newProfileKey))")
             return
@@ -273,7 +310,9 @@ final class Orchestrator: ObservableObject {
         wakeSettleStage = .awaitingFirstRestore
         wakeSettleExpectedKey = expected
         wakeSettleLastRestoredKey = ""
-        armWakeSettleTimer()
+        wakeSettleLastRestoredFingerprint = ""
+        wakeSettleRestoreInterrupted = false
+        armWakeSettleTimer(delay: Constants.Timing.wakeSettleDelay)
     }
 
     private func handleScreenChangeInWakeSettle(newProfileKey: String) {
@@ -282,9 +321,14 @@ final class Orchestrator: ObservableObject {
             if !wakeSettleExpectedKey.isEmpty, newProfileKey == wakeSettleExpectedKey {
                 Log.screen.info("Wake-settle: matched expected profile, restoring early (profile=\(newProfileKey))")
                 restoreInWakeSettle(profileKey: newProfileKey)
+            } else if hasDisplayMissingFromExpected(newProfileKey) {
+                // A display that was not there before suspend: a different desk, so the
+                // expected profile is not coming back. No point waiting the full timeout.
+                Log.screen.info("Wake-settle: new display set (have=\(newProfileKey) want=\(self.wakeSettleExpectedKey)) — short wait")
+                armWakeSettleTimer(delay: Constants.Timing.wakeSettleForeignDisplayDelay)
             } else {
                 Log.screen.info("Wake-settle: awaiting expected (have=\(newProfileKey) want=\(self.wakeSettleExpectedKey)) — re-arm")
-                armWakeSettleTimer()
+                armWakeSettleTimer(delay: Constants.Timing.wakeSettleDelay)
             }
 
         case .awaitingExit:
@@ -298,28 +342,33 @@ final class Orchestrator: ObservableObject {
                 Log.screen.info("Wake-settle cooldown: profile drifted back to expected — re-restoring")
                 restoreInWakeSettle(profileKey: newProfileKey)
             } else {
-                // Either an echo of the last restored profile or a transient
-                // flicker; absorb it and re-arm the cooldown.
+                // An echo or a transient flicker; absorb it. The cooldown exit check below
+                // catches geometry changes and interrupted restores once events stop.
                 Log.screen.info("Wake-settle cooldown: absorbing event (profile=\(newProfileKey) lastRestored=\(self.wakeSettleLastRestoredKey))")
-                armWakeSettleTimer()
+                armWakeSettleTimer(delay: Constants.Timing.wakeSettleCooldownDelay)
             }
         }
+    }
+
+    private func hasDisplayMissingFromExpected(_ profileKey: String) -> Bool {
+        guard !wakeSettleExpectedKey.isEmpty else { return false }
+        let expected = Set(wakeSettleExpectedKey.split(separator: "+"))
+        return profileKey.split(separator: "+").contains { !expected.contains($0) }
     }
 
     private func restoreInWakeSettle(profileKey: String) {
         handleScreenChange(newProfileKey: profileKey)
         wakeSettleLastRestoredKey = profileKey
+        wakeSettleLastRestoredFingerprint = screenDetector.topologyFingerprint
+        wakeSettleRestoreInterrupted = false
         wakeSettleStage = .awaitingExit
-        armWakeSettleTimer()
+        armWakeSettleTimer(delay: Constants.Timing.wakeSettleCooldownDelay)
     }
 
-    private func armWakeSettleTimer() {
+    private func armWakeSettleTimer(delay: TimeInterval) {
         wakeSettleGeneration &+= 1
         let myGeneration = wakeSettleGeneration
         let stage = wakeSettleStage
-        let delay: TimeInterval = stage == .awaitingFirstRestore
-            ? Constants.Timing.wakeSettleDelay
-            : Constants.Timing.wakeSettleCooldownDelay
 
         scheduleAfter(delay) { [weak self] in
             guard let self else { return }
@@ -328,43 +377,76 @@ final class Orchestrator: ObservableObject {
 
             switch stage {
             case .awaitingFirstRestore:
+                let key = self.screenDetector.profileKey
+                if !self.sawDisplayEventSinceSuspend,
+                   key == self.suspendProfileKey,
+                   self.screenDetector.topologyFingerprint == self.suspendFingerprint {
+                    // Lock / unlock without any display change: windows never moved, and a
+                    // restore would only undo what the user did since unlocking.
+                    Log.screen.info("Wake-settle: displays unchanged since suspend — skipping restore")
+                    self.exitWakeSettleWindow()
+                    return
+                }
                 // Heuristic never matched within the timeout — best-effort restore
                 // against whatever the detector currently reports.
-                let key = self.screenDetector.profileKey
                 Log.screen.info("Wake-settle timeout: restoring against current profile=\(key)")
                 self.restoreInWakeSettle(profileKey: key)
             case .awaitingExit:
-                // Cooldown may have absorbed a genuine change (e.g. a display plugged
-                // in mid-cooldown). If the detector's profile no longer matches what
-                // we last restored, restore once more instead of exiting stale.
+                // Cooldown may have absorbed a genuine change (a display plugged in, or the
+                // same displays settling on a different mode or arrangement), or a begin
+                // pulse may have cut the last restore short. Restore once more instead of
+                // exiting with a stale or half-finished layout.
                 let current = self.screenDetector.profileKey
-                if !current.isEmpty, current != self.wakeSettleLastRestoredKey {
-                    Log.screen.info("Wake-settle cooldown elapsed with drifted profile (\(current)) — restoring before exit")
+                let fingerprint = self.screenDetector.topologyFingerprint
+                let reason: String?
+                if current != self.wakeSettleLastRestoredKey {
+                    reason = "profile drifted to \(current)"
+                } else if fingerprint != self.wakeSettleLastRestoredFingerprint {
+                    reason = "display geometry changed"
+                } else if self.wakeSettleRestoreInterrupted {
+                    reason = "previous restore was interrupted"
+                } else {
+                    reason = nil
+                }
+                if !current.isEmpty, let reason {
+                    Log.screen.info("Wake-settle cooldown elapsed (\(reason)) — restoring before exit")
                     self.restoreInWakeSettle(profileKey: current)
                 } else {
                     Log.screen.info("Wake-settle cooldown elapsed — exiting wake-settle window")
-                    self.isInWakeSettleWindow = false
-                    self.isScreenReconfiguring = false
+                    self.exitWakeSettleWindow()
                 }
             }
         }
     }
 
+    private func exitWakeSettleWindow() {
+        isInWakeSettleWindow = false
+        isScreenReconfiguring = false
+        didSettle()
+    }
+
     /// Best-effort save of the current (pre-change) profile the moment a display
     /// reconfiguration is announced, while windows are still where the user left them.
     func handleScreenWillChange() {
-        snapshotStore.cancelRestore()
-        ruleApplyService.cancelPendingLaunches()
+        noteDisplayEventIfSettling()
+        let interruptedRestore = snapshotStore.cancelRestore()
+        let interruptedRules = ruleApplyService.cancelPendingWork()
+        if isInWakeSettleWindow, wakeSettleStage == .awaitingExit, interruptedRestore || interruptedRules {
+            wakeSettleRestoreInterrupted = true
+        }
         screenSaveGeneration &+= 1
-        guard !isScreenReconfiguring else { return }
+        guard !isScreenReconfiguring else {
+            lastReconfigActivityAt = now()
+            return
+        }
         autoSaveCurrentLayout(trigger: .screenWillChange)
-        isScreenReconfiguring = true
+        markScreenReconfiguring()
     }
 
     func handleScreenChange(newProfileKey: String) {
         snapshotStore.cancelRestore()
-        ruleApplyService.cancelPendingLaunches()
-        isScreenReconfiguring = true
+        ruleApplyService.cancelPendingWork()
+        markScreenReconfiguring()
         screenSaveGeneration &+= 1
         guard !powerMonitor.isSuspended else { return }
         scheduleDelayedAutoSave(trigger: .screenChange, delay: Constants.Timing.screenChangeAutoSaveDelay)
@@ -391,6 +473,28 @@ final class Orchestrator: ObservableObject {
 
     }
 
+    private func markScreenReconfiguring() {
+        isScreenReconfiguring = true
+        lastReconfigActivityAt = now()
+    }
+
+    private func noteDisplayEventIfSettling() {
+        if powerMonitor.isSuspended || isInWakeSettleWindow {
+            sawDisplayEventSinceSuspend = true
+        }
+    }
+
+    /// Displays finished changing and saves are allowed again.
+    private func didSettle() {
+        guard !deferredAppLaunches.isEmpty else { return }
+        let launches = deferredAppLaunches
+        deferredAppLaunches.removeAll()
+        Log.rule.info("Replaying \(launches.count) app launches deferred while displays were changing")
+        for launch in launches {
+            handleAppLaunch(bundleId: launch.bundleId, appName: launch.appName)
+        }
+    }
+
     // MARK: - App launch rules
 
     private func setupAppLaunchHandler() {
@@ -405,7 +509,14 @@ final class Orchestrator: ObservableObject {
     }
 
     func handleAppLaunch(bundleId: String?, appName: String?) {
-        guard !powerMonitor.isSuspended, !isScreenReconfiguring, !isInWakeSettleWindow else { return }
+        if powerMonitor.isSuspended || isScreenReconfiguring || isInWakeSettleWindow {
+            // Moving windows now would race the display change; apply the rule once it settles.
+            if !deferredAppLaunches.contains(where: { $0.bundleId == bundleId && $0.appName == appName }) {
+                deferredAppLaunches.append((bundleId, appName))
+                if deferredAppLaunches.count > 20 { deferredAppLaunches.removeFirst() }
+            }
+            return
+        }
         guard ensureAccessibilityPermission(promptIfNeeded: false) else { return }
 
         ruleApplyService.handleAppLaunch(bundleId: bundleId, appName: appName) { [weak self] result in
@@ -418,10 +529,26 @@ final class Orchestrator: ObservableObject {
 
     private func setupAutoSaveTimer() {
         let timer = Timer(timeInterval: Constants.Timing.layoutAutoSaveInterval, repeats: true) { [weak self] _ in
-            self?.autoSaveCurrentLayout(trigger: .periodic)
+            self?.performPeriodicTick()
         }
+        timer.tolerance = Constants.Timing.layoutAutoSaveTolerance
         RunLoop.main.add(timer, forMode: .common)
         autoSaveTimer = timer
+    }
+
+    /// Windows rarely move without mouse or keyboard input, so the periodic AX sweep only
+    /// runs when there has been input since the last capture. Display changes, wake and
+    /// app launches have their own saves and do not depend on this.
+    private func performPeriodicTick() {
+        if let lastCapture = lastLayoutCaptureAt {
+            let lastInput = now().addingTimeInterval(-secondsSinceLastUserInput())
+            guard lastInput >= lastCapture else { return }
+        }
+        autoSaveCurrentLayout(trigger: .periodic)
+    }
+
+    func performPeriodicTickForTesting() {
+        performPeriodicTick()
     }
 
     private func scheduleDelayedAutoSave(trigger: SnapshotService.Trigger, delay: TimeInterval) {
@@ -430,7 +557,10 @@ final class Orchestrator: ObservableObject {
         scheduleAfter(delay) { [weak self] in
             guard let self, self.screenSaveGeneration == generation,
                   self.screenDetector.profileKey == profileKey else { return }
-            if trigger == .screenChange { self.isScreenReconfiguring = false }
+            if trigger == .screenChange, self.isScreenReconfiguring {
+                self.isScreenReconfiguring = false
+                if !self.isInWakeSettleWindow { self.didSettle() }
+            }
             self.autoSaveCurrentLayout(trigger: trigger)
         }
     }
@@ -440,15 +570,47 @@ final class Orchestrator: ObservableObject {
     }
 
     private func autoSaveCurrentLayout(trigger: SnapshotService.Trigger) {
-        // Never persist layouts while the system is suspended (sleep/lock) or still
-        // settling after wake — captures taken in those windows are the transitional
-        // states macOS produces mid-reconfig, and saving them overwrites good snapshots.
-        if powerMonitor.isSuspended || isInWakeSettleWindow || isScreenReconfiguring {
-            Log.snapshot.info("Skipped snapshot save [\(trigger.logLabel)]: system suspended or settling after wake")
+        // Never persist layouts while the system is suspended (sleep/lock), still settling
+        // after wake, or mid display change — captures taken in those windows are the
+        // transitional states macOS produces, and saving them overwrites good snapshots.
+        if let reason = saveBlockReason() {
+            Log.snapshot.info("Skipped snapshot save [\(trigger.logLabel)]: \(reason)")
             return
         }
-        guard ensureAccessibilityPermission(promptIfNeeded: false) else { return }
-        _ = snapshotService.saveCurrentLayout(trigger: trigger, force: false)
+        _ = captureLayout(trigger: trigger, force: false)
+    }
+
+    private func saveBlockReason() -> String? {
+        if powerMonitor.isSuspended { return "system suspended" }
+        if isInWakeSettleWindow { return "settling after wake" }
+        guard isScreenReconfiguring else { return nil }
+        if let lastActivity = lastReconfigActivityAt,
+           now().timeIntervalSince(lastActivity) > Constants.Timing.reconfigWatchdogDelay {
+            Log.screen.warning("Display reconfiguration flag still set \(Int(now().timeIntervalSince(lastActivity)))s after the last display event; clearing it")
+            isScreenReconfiguring = false
+            didSettle()
+            return nil
+        }
+        return "displays are reconfiguring"
+    }
+
+    @discardableResult
+    private func captureLayout(trigger: SnapshotService.Trigger, force: Bool) -> SnapshotService.SaveResult? {
+        guard ensureAccessibilityPermission(promptIfNeeded: false) else { return nil }
+        let startedAt = now()
+        // The pre-change save races WindowServer; drop it if the displays already changed.
+        let validate: (() -> Bool)? = trigger == .screenWillChange
+            ? { [screenDetector] in screenDetector.liveGeometryMatchesScreens() }
+            : nil
+        let result = snapshotService.saveCurrentLayout(trigger: trigger, force: force, validate: validate)
+        switch result {
+        case .saved, .unchanged, .noWindows:
+            lastLayoutCaptureAt = startedAt
+        case .discarded, .deferred, .failed:
+            // Nothing usable was recorded; let the next periodic tick try again.
+            break
+        }
+        return result
     }
 
     @discardableResult

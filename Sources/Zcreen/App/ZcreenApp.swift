@@ -3,10 +3,11 @@ import SwiftUI
 @main
 struct ZcreenApp: App {
     @StateObject private var orchestrator = Orchestrator()
+    @StateObject private var diskSpace = DiskSpaceMonitor()
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarView(orchestrator: orchestrator)
+            MenuBarView(orchestrator: orchestrator, diskSpace: diskSpace)
         } label: {
             MenuBarStatusIconView(caffeinateManager: orchestrator.caffeinateManager)
         }

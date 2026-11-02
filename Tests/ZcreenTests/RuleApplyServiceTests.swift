@@ -327,7 +327,7 @@ private final class RuleTestWindowManager: WindowManager {
         windows.filter { $0.bundleId == bundleId }
     }
 
-    override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect) {
+    override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect, constrainedTo bounds: CGRect? = nil) {
         moves.append((window, frame))
     }
 

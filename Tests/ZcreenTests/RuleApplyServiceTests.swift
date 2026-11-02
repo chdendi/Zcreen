@@ -221,6 +221,49 @@ final class RuleApplyServiceTests: XCTestCase {
         XCTAssertTrue(fixture.manager.fallbackMoves.isEmpty)
     }
 
+    func testRuleAppWithoutWindowsYetIsRetriedAfterRestore() throws {
+        var pending: [() -> Void] = []
+        let fixture = makeFixture(scheduleAfter: { _, action in pending.append(action) },
+                                  runningApps: { [RuleApplyService.RunningApp(bundleId: self.bundleId, name: "Ghostty")] })
+        save([savedWindow(frame: portraitFrame, screen: fixture.portrait, screens: fixture.screens)], in: fixture)
+
+        XCTAssertEqual(fixture.service.applyRulesIfAvailable(), 0)
+        XCTAssertEqual(pending.count, 1, "A running rule app whose windows AX cannot see yet is retried")
+
+        fixture.manager.windows = [runningWindow()]
+        pending.removeFirst()()
+
+        XCTAssertEqual(try XCTUnwrap(fixture.manager.moves.first).frame, portraitFrame)
+        XCTAssertTrue(pending.isEmpty)
+    }
+
+    func testRuleRetryStopsWhenCancelledOrAppIsNotRunning() {
+        var pending: [() -> Void] = []
+        let fixture = makeFixture(scheduleAfter: { _, action in pending.append(action) },
+                                  runningApps: { [RuleApplyService.RunningApp(bundleId: self.bundleId, name: "Ghostty")] })
+        _ = fixture.service.applyRulesIfAvailable()
+        XCTAssertTrue(fixture.service.cancelPendingWork(), "Cancel reports the retry it stopped")
+        fixture.manager.windows = [runningWindow()]
+        pending.forEach { $0() }
+        XCTAssertTrue(fixture.manager.moves.isEmpty && fixture.manager.fallbackMoves.isEmpty)
+
+        pending.removeAll()
+        let notRunning = makeFixture(scheduleAfter: { _, action in pending.append(action) }, runningApps: { [] })
+        _ = notRunning.service.applyRulesIfAvailable()
+        XCTAssertTrue(pending.isEmpty)
+    }
+
+    func testRestoredWindowAlreadyAtSavedFrameIsNotMovedAgain() {
+        let fixture = makeFixture()
+        save([savedWindow(frame: portraitFrame, screen: fixture.portrait, screens: fixture.screens)], in: fixture)
+        fixture.manager.windows = [runningWindow(frame: portraitFrame)]
+
+        launch(fixture)
+
+        XCTAssertTrue(fixture.manager.moves.isEmpty)
+        XCTAssertTrue(fixture.manager.fallbackMoves.isEmpty)
+    }
+
     private struct Fixture {
         let service: RuleApplyService
         let detector: ScreenDetector
@@ -233,7 +276,8 @@ final class RuleApplyServiceTests: XCTestCase {
     }
 
     private func makeFixture(
-        scheduleAfter: @escaping (TimeInterval, @escaping () -> Void) -> Void = { _, _ in }
+        scheduleAfter: @escaping (TimeInterval, @escaping () -> Void) -> Void = { _, _ in },
+        runningApps: @escaping () -> [RuleApplyService.RunningApp] = { [] }
     ) -> Fixture {
         let builtIn = screen(id: 901, name: "Built-in Retina Display",
                              frame: CGRect(x: 0, y: 0, width: 1512, height: 982))
@@ -257,7 +301,8 @@ final class RuleApplyServiceTests: XCTestCase {
         let manager = RuleTestWindowManager()
         let service = RuleApplyService(screenSession: ScreenSessionService(screenDetector: detector),
                                        configManager: config, windowManager: manager, ruleEngine: RuleEngine(),
-                                       snapshotStore: store, scheduleAfter: scheduleAfter)
+                                       snapshotStore: store, scheduleAfter: scheduleAfter,
+                                       runningApps: runningApps)
         return Fixture(service: service, detector: detector, config: config, store: store,
                        manager: manager, portrait: portrait, landscape: landscape, screens: screens)
     }
@@ -325,6 +370,10 @@ private final class RuleTestWindowManager: WindowManager {
 
     override func getWindows(bundleId: String) -> [WindowInfo] {
         windows.filter { $0.bundleId == bundleId }
+    }
+
+    override func getWindows(bundleIds: Set<String>) -> [WindowInfo] {
+        windows.filter { bundleIds.contains($0.bundleId ?? "") }
     }
 
     override func moveWindow(_ window: AXUIElement, toFrame frame: CGRect, constrainedTo bounds: CGRect? = nil) {

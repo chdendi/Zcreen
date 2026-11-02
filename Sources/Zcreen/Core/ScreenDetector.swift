@@ -3,6 +3,22 @@ import Combine
 import CoreGraphics
 
 final class ScreenDetector: ObservableObject {
+    /// Display geometry as CoreGraphics reports it right now. Only fields that agree between
+    /// CoreGraphics (top-left origin) and AppKit (bottom-left origin) are kept.
+    struct DisplayGeometry: Hashable {
+        let displayID: CGDirectDisplayID
+        let x: Int
+        let width: Int
+        let height: Int
+
+        init(displayID: CGDirectDisplayID, frame: CGRect) {
+            self.displayID = displayID
+            self.x = Int(frame.minX.rounded())
+            self.width = Int(frame.width.rounded())
+            self.height = Int(frame.height.rounded())
+        }
+    }
+
     @Published private(set) var screens: [ScreenInfo] = []
     @Published private(set) var profileKey: String = ""
     @Published private(set) var profileLabel: String = ""
@@ -11,8 +27,32 @@ final class ScreenDetector: ObservableObject {
     private let beginConfigSubject = PassthroughSubject<Void, Never>()
     private var cancellables = Set<AnyCancellable>()
     private var callbackRegistered = false
+    private var liveGeometryProvider: () -> Set<DisplayGeometry>
 
     var screenCount: Int { screens.count }
+
+    /// Like `profileKey`, but also changes when a display's resolution, arrangement or
+    /// main-display role changes. Same physical displays do not imply the same layout.
+    var topologyFingerprint: String { Self.topologyFingerprint(of: screens) }
+
+    static func topologyFingerprint(of screens: [ScreenInfo]) -> String {
+        screens.map { screen in
+            let frame = screen.frame
+            return "\(screen.uniqueKey)@\(Int(frame.minX.rounded())),\(Int(frame.minY.rounded())),"
+                + "\(Int(frame.width.rounded()))x\(Int(frame.height.rounded()))"
+        }
+        .sorted()
+        .joined(separator: "|")
+    }
+
+    /// Whether WindowServer still reports the displays this detector last refreshed.
+    /// `NSScreen` only updates once the run loop delivers the screen-change notification,
+    /// so this asks CoreGraphics directly. Returns true when the live state is unavailable.
+    func liveGeometryMatchesScreens() -> Bool {
+        let live = liveGeometryProvider()
+        guard !live.isEmpty else { return true }
+        return live == Set(screens.map { DisplayGeometry(displayID: $0.displayID, frame: $0.frame) })
+    }
 
     /// Fires after screen changes settle. Emits the new profileKey.
     /// Wait for a quiet interval, including begin pulses, before refreshing topology.
@@ -33,7 +73,9 @@ final class ScreenDetector: ObservableObject {
         beginConfigSubject.eraseToAnyPublisher()
     }
 
-    init(shouldRegisterCallback: Bool = true) {
+    init(shouldRegisterCallback: Bool = true,
+         liveGeometryProvider: @escaping () -> Set<DisplayGeometry> = ScreenDetector.currentDisplayGeometry) {
+        self.liveGeometryProvider = liveGeometryProvider
         refreshScreens()
         if shouldRegisterCallback {
             registerCallback()
@@ -46,32 +88,38 @@ final class ScreenDetector: ObservableObject {
         }
     }
 
+    /// Screens as AppKit currently reports them, unsorted and without position labels.
+    static func currentSystemScreens() -> [ScreenInfo] {
+        NSScreen.screens.map { screen in
+            let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
+            return ScreenInfo(
+                displayID: displayID,
+                name: screen.localizedName,
+                frame: screen.frame,
+                isBuiltIn: CGDisplayIsBuiltin(displayID) != 0,
+                position: .single,
+                vendorID: CGDisplayVendorNumber(displayID),
+                modelID: CGDisplayModelNumber(displayID),
+                serialNumber: CGDisplaySerialNumber(displayID)
+            )
+        }
+    }
+
+    /// Active displays straight from WindowServer. Hardware mirrors are skipped because
+    /// AppKit exposes only one screen per mirror set.
+    static func currentDisplayGeometry() -> Set<DisplayGeometry> {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &ids, &count) == .success else { return [] }
+        return Set(ids.prefix(Int(count))
+            .filter { CGDisplayMirrorsDisplay($0) == kCGNullDirectDisplay }
+            .map { DisplayGeometry(displayID: $0, frame: CGDisplayBounds($0)) })
+    }
+
     @discardableResult
     func refreshScreens() -> String {
-        let nsScreens = NSScreen.screens
-        var infos: [ScreenInfo] = []
-
-        for screen in nsScreens {
-            let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
-            let name = screen.localizedName
-            let frame = screen.frame
-            let isBuiltIn = CGDisplayIsBuiltin(displayID) != 0
-            let vendorID = CGDisplayVendorNumber(displayID)
-            let modelID = CGDisplayModelNumber(displayID)
-            let serialNumber = CGDisplaySerialNumber(displayID)
-
-            infos.append(ScreenInfo(
-                displayID: displayID,
-                name: name,
-                frame: frame,
-                isBuiltIn: isBuiltIn,
-                position: .single,
-                vendorID: vendorID,
-                modelID: modelID,
-                serialNumber: serialNumber
-            ))
-        }
-
+        var infos = Self.currentSystemScreens()
         infos.sort { $0.frame.origin.x < $1.frame.origin.x }
         screens = assignPositions(infos)
         profileKey = generateProfileKey(from: screens)
@@ -149,7 +197,12 @@ final class ScreenDetector: ObservableObject {
         screenChangeSubject.send(true)
     }
 
-    func setStateForTesting(screens: [ScreenInfo], profileKey: String? = nil, profileLabel: String? = nil) {
+    /// Replaces the detected state. Unless `liveGeometry` is given, WindowServer is assumed
+    /// to report the same displays.
+    func setStateForTesting(screens: [ScreenInfo], profileKey: String? = nil, profileLabel: String? = nil,
+                            liveGeometry: Set<DisplayGeometry>? = nil) {
+        let geometry = liveGeometry ?? Set(screens.map { DisplayGeometry(displayID: $0.displayID, frame: $0.frame) })
+        liveGeometryProvider = { geometry }
         let sorted = screens.sorted { $0.frame.origin.x < $1.frame.origin.x }
         self.screens = assignPositions(sorted)
         self.profileKey = profileKey ?? generateProfileKey(from: self.screens)

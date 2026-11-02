@@ -3,6 +3,9 @@ import ApplicationServices
 
 class WindowManager {
     private let screenFramesProvider: () -> [CGRect]
+    /// Apps whose AX calls recently timed out, skipped until the stored date so one hung
+    /// app does not stall every enumeration on the main thread.
+    private var unresponsiveUntil: [pid_t: Date] = [:]
 
     init(screenFramesProvider: @escaping () -> [CGRect] = { NSScreen.screens.map(\.frame) }) {
         self.screenFramesProvider = screenFramesProvider
@@ -25,22 +28,46 @@ class WindowManager {
             Log.window.warning("Accessibility not trusted, cannot enumerate windows")
             return []
         }
+        return enumerateWindows { _ in true }
+    }
 
+    /// Windows of the given apps only (an empty bundle ID stands for apps without one).
+    /// Restore paths use this so apps absent from the snapshot are never queried.
+    func getWindows(bundleIds: Set<String>) -> [WindowInfo] {
+        guard !bundleIds.isEmpty, AccessibilityHelper.isTrusted else { return [] }
+        return enumerateWindows { bundleIds.contains($0.bundleIdentifier ?? "") }
+    }
+
+    private func enumerateWindows(including include: (NSRunningApplication) -> Bool) -> [WindowInfo] {
         var result: [WindowInfo] = []
-        let workspace = NSWorkspace.shared
+        let now = Date()
+        unresponsiveUntil = unresponsiveUntil.filter { $0.value > now }
 
-        for app in workspace.runningApplications where app.activationPolicy == .regular {
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && include(app) {
             let pid = app.processIdentifier
+            guard unresponsiveUntil[pid] == nil else { continue }
             let bundleId = app.bundleIdentifier
             let appName = app.localizedName ?? "Unknown"
 
             let appElement = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(appElement, Constants.Accessibility.messagingTimeout)
             var windowsRef: CFTypeRef?
             let err = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef)
+            if err == .cannotComplete {
+                markUnresponsive(pid: pid, appName: appName)
+                continue
+            }
             guard err == .success, let windows = windowsRef as? [AXUIElement] else { continue }
 
             for window in windows {
-                guard let frame = getWindowFrame(window) else { continue }
+                // The timeout is stored on this element, so later moves of the window inherit it.
+                AXUIElementSetMessagingTimeout(window, Constants.Accessibility.messagingTimeout)
+                let (frame, frameError) = readWindowFrame(window)
+                if frameError == .cannotComplete {
+                    markUnresponsive(pid: pid, appName: appName)
+                    break
+                }
+                guard let frame else { continue }
                 let title = getWindowTitle(window)
                 let role = getStringAttribute(window, attribute: kAXRoleAttribute as CFString)
                 let subrole = getStringAttribute(window, attribute: kAXSubroleAttribute as CFString)
@@ -62,44 +89,29 @@ class WindowManager {
         return result
     }
 
+    private func markUnresponsive(pid: pid_t, appName: String) {
+        unresponsiveUntil[pid] = Date().addingTimeInterval(Constants.Accessibility.unresponsiveBackoff)
+        Log.window.warning(
+            "AX timed out for \(appName) (pid \(pid)); skipping it for \(Int(Constants.Accessibility.unresponsiveBackoff))s"
+        )
+    }
+
+    /// Current frame of a window in Accessibility coordinates, or nil when it cannot be read.
+    func frame(of window: AXUIElement) -> CGRect? {
+        readWindowFrame(window).frame
+    }
+
     func getWindows(bundleId: String) -> [WindowInfo] {
         guard AccessibilityHelper.isTrusted else { return [] }
-
-        let workspace = NSWorkspace.shared
-        guard let app = workspace.runningApplications.first(where: { $0.bundleIdentifier == bundleId }) else {
-            return []
-        }
-
-        let pid = app.processIdentifier
-        let appName = app.localizedName ?? "Unknown"
-        let appElement = AXUIElementCreateApplication(pid)
-
-        var windowsRef: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef)
-        guard err == .success, let windows = windowsRef as? [AXUIElement] else { return [] }
-
-        return windows.compactMap { window in
-            guard let frame = getWindowFrame(window) else { return nil }
-            let title = getWindowTitle(window)
-            let role = getStringAttribute(window, attribute: kAXRoleAttribute as CFString)
-            let subrole = getStringAttribute(window, attribute: kAXSubroleAttribute as CFString)
-            let isMinimized = getBoolAttribute(window, attribute: kAXMinimizedAttribute as CFString) ?? false
-            return WindowInfo(
-                pid: pid,
-                bundleId: bundleId,
-                appName: appName,
-                title: title,
-                role: role,
-                subrole: subrole,
-                isMinimized: isMinimized,
-                frame: frame,
-                axWindow: window
-            )
-        }
+        return enumerateWindows { $0.bundleIdentifier == bundleId }
     }
 
     func getAllWindows(filter: WindowFilter) -> [WindowInfo] {
         getAllWindows().filter(filter.allows(window:))
+    }
+
+    func getWindows(bundleIds: Set<String>, filter: WindowFilter) -> [WindowInfo] {
+        getWindows(bundleIds: bundleIds).filter(filter.allows(window:))
     }
 
     func getWindows(bundleId: String, filter: WindowFilter) -> [WindowInfo] {
@@ -128,15 +140,26 @@ class WindowManager {
         return err
     }
 
+    /// 恢复与规则路径使用的入口；测试替身覆盖这个方法记录移动。
+    func moveWindow(_ window: AXUIElement, toFrame frame: CGRect) {
+        moveWindow(window, toFrame: frame, constrainedTo: nil)
+    }
+
     /// 多段式 set：size → position → size → position；末尾留 setPosition，避免某些 app
     /// 在收到 resize 通知后内部 layout 把 position attribute 又 reset 回去。
     /// 第一轮后如果实际 frame 偏差仍 >5pt，做一次反向兜底（position → size → position）。
-    func moveWindow(_ window: AXUIElement, toFrame frame: CGRect, constrainedTo bounds: CGRect? = nil) {
+    func moveWindow(_ window: AXUIElement, toFrame frame: CGRect, constrainedTo bounds: CGRect?) {
         let originalFrame = getWindowFrame(window)
+        var aborted = false
 
         withEnhancedUserInterfaceDisabled(for: window) {
-            // Pass 1: size-first，收尾 position
-            resizeWindow(window, to: frame.size)
+            // Pass 1: size-first，收尾 position。首个调用就超时说明 app 无响应，
+            // 后续每次 set 都会再等一个超时，直接放弃这个窗口。
+            if resizeWindow(window, to: frame.size) == .cannotComplete {
+                Log.window.warning("moveWindow aborted [\(appDescription(for: window))]: app did not respond")
+                aborted = true
+                return
+            }
             moveWindow(window, to: frame.origin)
             resizeWindow(window, to: frame.size)
             moveWindow(window, to: frame.origin)
@@ -178,7 +201,7 @@ class WindowManager {
         }
 
         // 最终校验，如果偏差仍 >10pt 记一条 warning 便于复盘
-        if let actual = getWindowFrame(window) {
+        if !aborted, let actual = getWindowFrame(window) {
             let dx = abs(actual.origin.x - frame.origin.x)
             let dy = abs(actual.origin.y - frame.origin.y)
             let dw = abs(actual.width - frame.width)
@@ -295,19 +318,27 @@ class WindowManager {
     // MARK: - Private
 
     private func getWindowFrame(_ window: AXUIElement) -> CGRect? {
+        readWindowFrame(window).frame
+    }
+
+    private func readWindowFrame(_ window: AXUIElement) -> (frame: CGRect?, error: AXError) {
         var positionRef: CFTypeRef?
         var sizeRef: CFTypeRef?
 
-        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionRef) == .success,
-              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success
-        else { return nil }
+        let positionError = AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionRef)
+        guard positionError == .success else { return (nil, positionError) }
+        let sizeError = AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef)
+        guard sizeError == .success,
+              let positionValue = positionRef, CFGetTypeID(positionValue) == AXValueGetTypeID(),
+              let sizeValue = sizeRef, CFGetTypeID(sizeValue) == AXValueGetTypeID()
+        else { return (nil, sizeError) }
 
         var position = CGPoint.zero
         var size = CGSize.zero
-        AXValueGetValue(positionRef as! AXValue, .cgPoint, &position)
-        AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+        AXValueGetValue(positionValue as! AXValue, .cgPoint, &position)
+        AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
 
-        return CGRect(origin: position, size: size)
+        return (CGRect(origin: position, size: size), .success)
     }
 
     private func getWindowTitle(_ window: AXUIElement) -> String? {

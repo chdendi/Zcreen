@@ -1,4 +1,5 @@
 import XCTest
+import ApplicationServices
 @testable import Zcreen
 
 final class WindowMatcherTests: XCTestCase {
@@ -76,7 +77,48 @@ final class WindowMatcherTests: XCTestCase {
         XCTAssertEqual(assignments.first(where: { $0.savedIndex == 1 })?.runningIndex, 0)
     }
 
-    func testScreenKeyMismatchPenalizedRelativeToNoScreenKey() {
+    func testEvictedUntitledWindowsStillMatchBySize() {
+        // Both windows were on the external display; macOS moved them to the built-in one and
+        // shrank them a little. Their current screen says nothing about which saved slot is whose.
+        let saved = [
+            makeSnapshot(title: nil, width: 1200, height: 900, screenKey: "uuid-external"),
+            makeSnapshot(title: nil, width: 700, height: 500, screenKey: "uuid-external"),
+        ]
+        let running = [
+            makeCandidate(title: nil, width: 1190, height: 890, screenKey: "uuid-builtin"),
+            makeCandidate(title: nil, width: 690, height: 495, screenKey: "uuid-builtin"),
+        ]
+
+        let assignments = WindowMatcher.match(saved: saved, running: running)
+
+        XCTAssertEqual(assignments.count, 2)
+        XCTAssertEqual(assignments.first(where: { $0.savedIndex == 0 })?.runningIndex, 0)
+        XCTAssertEqual(assignments.first(where: { $0.savedIndex == 1 })?.runningIndex, 1)
+    }
+
+    func testIdentityWinsOverConflictingHeuristics() {
+        let saved = [
+            makeSnapshot(title: "Old tab title", width: 900, height: 700),
+            makeSnapshot(title: "Other", width: 900, height: 700),
+        ]
+        // The window we captured as "Old tab title" now shows "Other" as its title.
+        let running = [
+            makeCandidate(title: "Other", width: 900, height: 700),
+            makeCandidate(title: "Something new", width: 900, height: 700),
+        ]
+        let first = AXUIElementCreateApplication(801)
+        let second = AXUIElementCreateApplication(802)
+
+        let assignments = WindowMatcher.match(saved: saved, running: running,
+                                              savedElements: [first, nil], runningElements: [first, second])
+
+        let identity = assignments.first { $0.savedIndex == 0 }
+        XCTAssertEqual(identity?.runningIndex, 0)
+        XCTAssertTrue(identity?.isIdentity == true)
+        XCTAssertNil(assignments.first { $0.savedIndex == 1 }, "The heuristic must not reuse the identity-matched window")
+    }
+
+    func testMatchingScreenKeyWinsOverDifferentScreen() {
         // Saved has a screenKey; one running candidate matches it, another has a different key.
         // The matching screenKey should win even though the other candidate has identical other signals.
         let saved = makeSnapshot(title: "Doc", width: 800, height: 600, screenKey: "uuid-a")

@@ -41,13 +41,13 @@ final class DiskSpaceMonitor: ObservableObject {
         if startMonitoring {
             refresh()
             let timer = Timer(timeInterval: 300, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.refresh() }
+                Task { @MainActor [weak self] in self?.refresh() }
             }
             RunLoop.main.add(timer, forMode: .common)
             self.timer = timer
             wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
                 forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-            ) { [weak self] _ in Task { @MainActor in self?.refresh() } }
+            ) { [weak self] _ in Task { @MainActor [weak self] in self?.refresh() } }
         }
     }
 
